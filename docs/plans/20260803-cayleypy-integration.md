@@ -178,12 +178,14 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 **Files:**
 - Create: `cayleypy/models/tokenizer.py`, `cayleypy/models/tokenizer_test.py`
 - Modify: `cayleypy/models/__init__.py`, `docs/api.rst`
+- Modify: `cayleypy/__init__.py` (экспорт по конвенции Development Approach) ➕
 
-- [ ] ветка `feat/group-tokenizer` от PR1; `GroupTokenizer` по спеке `tokenizer_groups` (для мегаминкса: 20 углов×3 + 30 рёбер×2 → 50 токенов, словарь 60)
-- [ ] write tests (success): корректность на малой головоломке с известной раскладкой
-- [ ] write tests (error/edge): несогласованная спека (сумма групп ≠ длине состояния)
-- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
-- [ ] открыть PR
+- [x] ветка `feat/group-tokenizer` от PR1; `GroupTokenizer` по спеке `tokenizer_groups` (для мегаминкса: 20 углов×3 + 30 рёбер×2 → 50 токенов, словарь 60) — семантика: токен i = значение **первого элемента** группы i, отсчитанное от начала своего сегмента (сегмент = одна пара `[group_size, num_groups]`); значит токен кодирует «какая деталь в слоте + её ориентация», `vocab_size = max(group_size*num_groups)` (для мегаминкса 60 = 20×3 = 30×2), `n_tokens = 50`, плюс `token_type_ids` (сегмент каждого токена — модель PR5 сможет отличать углы от рёбер отдельным эмбеддингом); выход всегда int64 (нужен `nn.Embedding`), поддержан и батч `[B, state_size]`, и одиночное состояние; индексные тензоры переносятся на устройство состояний (класс — не `nn.Module`, чтобы не мусорить в state_dict); `from_config(config)` сверяет спеку с `input_size`
+- [x] ➕ **вне первоначального охвата: `verify(graph_def)`** — проверка, что кодирование без потерь: у центрального состояния и у **каждого генератора** каждая группа = стикеры одной детали в том же циклическом порядке (индукция: если это верно для генератора-перестановки, свойство сохраняется на всех достижимых состояниях). Проверено по данным репо: мегаминкс `[[3,20],[2,30]]` и `mini_pyramorphix` `[[3,8]]` проходят, `rubik_cube(2,"QTM")` с `[[3,8]]` — нет (стикеры угла не в соседних позициях). Без этой проверки ошибочная спека даёт молча необратимую токенизацию
+- [x] write tests (success): корректность на малой головоломке с известной раскладкой — 12 новых тестов: ручная раскладка `[[2,2],[1,3]]` (2 детали по 2 стикера + 3 детали по 1) с литеральными ожидаемыми токенами (включая случай «детали переставлены и повёрнуты»), размеры и токены центрального состояния мегаминкса, батч vs одиночное состояние (+dtype), **losslessness** (40 шагов по генераторам мегаминкса: число уникальных строк токенов == число уникальных состояний), `verify` на двух реальных головоломках, `from_config`
+- [x] write tests (error/edge): несогласованная спека (сумма групп ≠ длине состояния) — плюс 0-мерный вход, пустой список групп, пара не из 2 чисел, неположительные размеры, конфиг без `tokenizer_groups`, спека vs `input_size`, `verify` на неверной группировке (сбитый циклический порядок / смешение деталей разных типов / цвета вместо ид стикеров), не-перестановочный граф (`MatrixGroups.heisenberg()`) и несовпадение `state_size`
+- [x] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task — lint зелёный (black 64, pylint 10.00/10, mypy 64 файла), `black --check .` по всему репо зелёный, `docs/build_docs.sh` (`-W`) зелёный; `RUN_SLOW_TESTS=1 pytest` = **335 passed / 12 skipped / 3 xfailed** и на 3.12 (torch 2.13), и на 3.9 (`.venv39`, torch 2.8)
+- [x] открыть PR — [stasdiener/cayleypy#4](https://github.com/stasdiener/cayleypy/pull/4), Draft, base `feat/score-children-contract`, в upstream не отправлялось
 
 ### Task 6: PR5 — Q-трансформер
 
@@ -383,7 +385,8 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 | PR1 | `feat/score-children-contract` | open в форке — [#1](https://github.com/stasdiener/cayleypy/pull/1) (base = `main` форка) |
 | PR2 | `feat/child-scored-beam` | draft в форке — [#2](https://github.com/stasdiener/cayleypy/pull/2) (base = `feat/score-children-contract`; Draft до мержа PR1) |
 | PR3 | `feat/resmlp-qmlp` | draft в форке — [#3](https://github.com/stasdiener/cayleypy/pull/3) (base = `feat/score-children-contract`; Draft до мержа PR1) |
-| PR4 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
+| PR4 | `feat/group-tokenizer` | draft в форке — [#4](https://github.com/stasdiener/cayleypy/pull/4) (base = `feat/score-children-contract`; Draft до мержа PR1) |
+| PR5 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
 
 **Фаза публикации в upstream (после ручной проверки пользователем; порядок и сроки — его решение):**
 - открыть design-issue в upstream: роадмап, ссылки на #151/#188, вопрос о судьбе #157/#175/#177/#170
