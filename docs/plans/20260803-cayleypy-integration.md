@@ -1,0 +1,407 @@
+# CayleyPy Integration: серия PR для модельного слоя, тренера и поиска
+
+## Overview
+
+Интеграция в библиотеку [cayleypy/cayleypy](https://github.com/cayleypy/cayleypy) функциональности, которая сейчас живёт вокруг неё в ноутбуках и личных репозиториях группы:
+
+- контракт `score_children` для многовыходных моделей (Q-модели с выходом на каждый генератор) **и его потребитель в beam search** (child-scored шаг луча — без него модельный слой не даёт пользы конечному пользователю);
+- расширенный `ModelConfig` + самоописывающий формат чекпойнта (лечит проблему «голых .pth»);
+- архитектуры: ResMLP, Q-MLP (n выходов), токенизатор + Q-трансформер (архитектура Влада), AZ-головы (q+v, v-consistency Андрея — inference-time, внутри `QVModel.score_children`);
+- ансамбли предикторов (плоская взвешенная сумма скоров — даёт эффект ×2 к ширине луча);
+- симметрии: `SymmetryGroup` + TTA (один PR) и канонический дедуп в луче (отдельный PR);
+- non-backtracking для `search_simple` (в нём сегодня нет никакого бана; в `search_advanced` это уже покрыто `history_depth`) — кандидат на выброс, если мейнтейнер возразит;
+- тренер (лоссы отдельным PR; пайплайн, к которому независимо сошлись Влад и Андрей: random walks + sparse-Q + BFS-anchors + данные из путей beam search);
+- **Bellman/DAVI-дообучение** — bootstrapped-таргеты `y(s) = 1 + min_a V(child_a)` с target-копией (идея из ноутбуков `alexandervc/cayleypy-rw-modelbaselines-megaminx`, включая подмешивание solved/соседей в Bellman-батч);
+- **демонстрационный чекпойнт**, обученный этим тренером и зарегистрированный в `PREDICTOR_MODELS` — чтобы архитектурные PR не были «мёртвым кодом» (режим отказа, убивший #151);
+- интерфейс `LowerBound` — жёсткие отсечения в луче по допустимой нижней оценке.
+
+**Вне охвата** (решение пользователя): бэкенды — адаптер CUDA-луча Ивана (precompiled), JAX/TPU-бэкенд, MITM-beam. См. Post-Completion.
+
+## Context (from discovery + verified by plan-review against upstream)
+
+- **Целевой репозиторий**: `cayleypy/cayleypy` (внешний). У пользователя `push: false` → форк + PR. **Правила upstream (README, «How to contribute»): нужно ДВА апрува от команды ревьюеров; пуш после апрува сбрасывает апрув; имя PR должно отражать изменения.** Последний мерж в `main` — 2026-05-24; PR #157 ждёт ревью с 11.2025; #151 approved 10.2025 и не смержен. Ревью — узкое место всего плана.
+- **Реальная структура** (проверено по коду `main`):
+  - `cayleypy/predictor.py` — `Predictor`, `__call__` батчит через `torch.hstack` (**корректно только для 1-D выходов**);
+  - `cayleypy/models/models.py` — `MlpModel` + `ModelConfig` (frozen dataclass); **фабрика — `ModelConfig._build_model` здесь же**; существующий `model_type` — строка `"MLP"` (uppercase); `cayleypy/models/models_lib.py` — только реестр претрейн-моделей `PREDICTOR_MODELS` (веса с Kaggle);
+  - `cayleypy/algo/beam_search.py` — **два независимых пути**: `search_simple` (MITM-приёмы, `return_path`, банов нет) и `search_advanced` (`history_depth` — hash-бан предыдущих уровней). Никакого iterated-режима/`hashed_neigbourhood` в `main` нет (это неслитые #175/#157). **Оба пути скорят плоский глобально-дедуплицированный набор** `get_unique_states(get_neighbors(...))` — связь родитель→ход разрушается до скоринга;
+  - `CayleyGraph.get_neighbors` пишет **generator-major** блоки (`neighbors[i*B:(i+1)*B]` = генератор i ко всем состояниям) — reshape в `[B, n_gen]` требует транспонирования;
+  - `CayleyGraphDef.generators_inverse_map` **уже существует** (None, если набор не замкнут по обратным), `generators_inverse_closed` тоже;
+  - `cayleypy/hasher.py`, `cayleypy/string_encoder.py`, `cayleypy/algo/random_walks.py` (есть `mode="nbt"` + `nbt_history_depth`);
+  - тесты `*_test.py` рядом с модулем; тяжёлые — под `RUN_SLOW_TESTS = os.getenv("RUN_SLOW_TESTS") == "1"` + `skipif` (паттерн в 6 файлах); CI: `RUN_SLOW_TESTS=1 pytest` (Ubuntu/macOS), bare `pytest` (Windows), матрица **Python 3.9**–3.13, отдельный job `build-docs` (`docs/api.rst` — autosummary по полным именам, символы должны экспортироваться в `__init__.py`);
+  - `./lint.sh` = black==25.1.0 (120) + mypy==1.15.0 + pylint; docstrings — Google style, комментарии заканчиваются точкой, pylint-warning'и чинить, а не отключать; reST `:param x:` в `beam_search.py`. **Уточнение из Task 1: отдельный CI-job `format-check` гоняет `black --check --diff .` по ВСЕМУ репозиторию (а `./lint.sh` — только по `./cayleypy`), поэтому любые новые .py вне пакета тоже должны быть отформатированы; на Python 3.9 CI ставит torch 2.8, а не 2.13 — новые torch-API проверять против 2.8.**
+- **Зависимости**: `h5py, kagglehub, numba, numpy, scipy, torch>=2.6.0`. **torch>=2.6 ⇒ `torch.load` по умолчанию `weights_only=True`.** Pydantic НЕТ.
+- **Конфликтная обстановка** (открытые PR upstream): **#157, #175, #177, #170 трогают `beam_search.py`; #170 трогает и `predictor.py`**; #151 (trainer, `cayleypy/trainers/`) — approved+stale; #188 (Иван, distributed BFS) — открыт. README: «Do not add new graphs to prepare_graph» — upstream сознательно избегает конфликтных файлов.
+- **Доноры кода**: [cayleypy-training-core](https://github.com/AnanasClassic/cayleypy-training-core) (Влад), пайплайн Андрея (SparseQSampler / BFSAnchors / symmetry transport, 02.08.2026), эмпирика Стаса (anchors 1–2%, 10% вредит; 154→139).
+
+## Development Approach
+
+- **testing approach**: Regular (код, затем тесты в том же PR), `*_test.py` рядом с модулем
+- **КРИТИЧНО: без новых runtime-зависимостей** — stdlib + имеющиеся torch/numpy; прогресс тренера — `verbose`-параметр + `print` (как в `beam_search.py`), никакого tqdm (в отличие от #151, тянувшего зависимости)
+- **КРИТИЧНО: синтаксис Python 3.9** (CI-матрица): `Optional[X]`/`Union` вместо `X | None`, никаких `match`; в frozen dataclass — `field(default_factory=...)` для изменяемых дефолтов
+- конвенции upstream: black 120, mypy, pylint (чинить, не отключать), Google-докстринги, комментарии с точкой на конце, reST `:param:`; каждый новый публичный класс — экспорт в `cayleypy/__init__.py` (+ subpackage `__init__.py`) и autosummary-запись в `docs/api.rst` в том же PR
+- обратная совместимость: существующие `Predictor`/`ModelConfig`/`beam_search`/претрейн-модели (`PREDICTOR_MODELS`) работают без изменений
+- **РЕЖИМ ВЫПОЛНЕНИЯ: все PR — только внутрь форка `stasdiener/cayleypy` (base = `main` форка или ветка-родитель). В upstream во время выполнения плана НЕ отправляется ничего — ни PR, ни issue.** Публикация в upstream — отдельная фаза после ручной проверки пользователем (см. Post-Completion)
+  - **защита от случайного upstream-PR**: в клоне выполнить `gh repo set-default stasdiener/cayleypy` (иначе `gh pr create` на форке по умолчанию целится в upstream); в веб-интерфейсе при создании PR проверять base-репозиторий
+  - мержи внутри форка делает пользователь (или по его решению — после самопроверки/агент-ревью); стекать base-ветками можно свободно — всё своё
+  - PR держать маленькими и в конвенциях upstream (линт, 3.9, тесты) — они без переделки станут upstream-PR на фазе публикации
+- PR, трогающие `beam_search.py` (PR2 → PR13 → PR14), — **строго последовательно** (текстовые конфликты между собой), каждый следующий от ветки предыдущего; за открытыми upstream-PR #157/#175/#177/#170 следить read-only (осведомлённость о будущих конфликтах)
+- один Task = один PR; завершать полностью перед началом зависимого
+- **CRITICAL: every task MUST include new/updated tests** (success + error отдельными пунктами)
+- **CRITICAL: all tests must pass before starting next task** (`./lint.sh && RUN_SLOW_TESTS=1 pytest` из корня)
+- **CRITICAL: update this plan file when scope changes during implementation**
+
+## Testing Strategy
+
+- **unit tests**: обязательны в каждом PR; лёгкие тесты — быстрый путь (≤ пары секунд), тяжёлые (тренировка, мегаминкс, глубокий BFS) — под `RUN_SLOW_TESTS`-паттерном репо
+- **ground truth**: точный BFS на малых графах; конкретные конструкторы, напр. `PermutationGroups.lrx(5)`; в тестах `device="cpu"` (конвенция после #184)
+- **паритет-тесты с Kaggle-весами**: публичные веса грузить как в `models_lib_test` (прецедент — без skipif); skipif только для приватного
+- **регресс претрейнов**: `models_lib_test.test_loads_predictor_models` должен оставаться зелёным после любых правок `MlpModel` (совместимость state_dict)
+- **детерминизм**: `torch.manual_seed`; ассерты вида «final loss < X% от initial», не «лосс → ~0»
+- локально перед пушем: `./lint.sh && RUN_SLOW_TESTS=1 pytest`; PR1 дополнительно прогнать под Python 3.9 (`uv run -p 3.9 pytest`)
+- **e2e**: нет UI — не применимо
+
+## Progress Tracking
+
+- отмечать `[x]` сразу; новые задачи — ➕; блокеры (ждём 2-й апрув, ждём ответа автора весов) — ⚠️
+- статусы PR вести в таблице в Post-Completion (внешние события — не чекбоксы)
+
+## Solution Overview
+
+**Стратегия: contract-first + consumer-first.** PR1 закладывает контракт `score_children` и ModelConfig v2; PR2 немедленно даёт контракту потребителя — child-scored шаг луча (иначе PR1–PR7 — мёртвый код). Дальше — независимые возможности, тонко нарезанные (уроки #151: большие PR в этом репо умирают).
+
+**Граф зависимостей PR:**
+
+```
+PR1 (контракт+конфиг+чекпойнт)
+ ├─ PR2 (child-scored beam step)        ── PR13 (канон-дедуп в луче) ── PR14 (nbt для search_simple)
+ ├─ PR3 (ResMLP/Q-MLP) ── PR6 (QV/AZ)   [PR2→13→14 строго последовательно: один файл]
+ ├─ PR4 (токенизатор) ── PR5 (Q-трансформер)
+ ├─ PR7 (ансамбли, плоские)
+ └─ PR9 (тренер-ядро) ── PR10 (anchors+sparse-Q+beam-пути) ── PR11 (демо-чекпойнт в PREDICTOR_MODELS)
+                          └─ PR16 (Bellman-дообучение; использует score_children из PR1)
+PR8 (лоссы) ── независим, можно параллельно с PR1
+PR12 (SymmetryGroup+TTA) ── зависит только от PR1
+PR15 (LowerBound) ── зависит от PR2 (или самостоятельно от main, если PR2 застрял)
+```
+
+**Ключевые решения:**
+1. `score_children(states) -> Tensor[B, n_gen]` в `Predictor`; дефолт — через скалярный предикт детей **с учётом generator-major раскладки `get_neighbors` (транспонирование)**; Q-модели переопределяют (1 forward родителя). Legacy-путь `Predictor.__call__` получает guard: 2-D выход модели → понятная ошибка (не тихий мисранк через `argsort`).
+2. Чекпойнт: `torch.save({"config": <dict из примитивов/JSON-строка>, "state_dict": ...})`, загрузка **явно `torch.load(..., weights_only=True)`**; валидация `graph_hash` (sha256 от `{generator_type, generators (perm-списки или matrix.tolist()+modulo), central_state}`) против графа.
+3. ModelConfig v2 — **плоские аддитивные поля** (`n_outputs: int = 1`, `tokenizer_groups: Optional[...] = None`, `graph_hash: Optional[str] = None`), а не dict-union: mypy-дружелюбно, `from_dict` расширяется явно. Существующий `model_type="MLP"` (uppercase) сохраняется; новые типы регистрируются в `ModelConfig._build_model`.
+4. v-consistency — inference-time (по Андрею: «это только в бим серче»), внутри `QVModel.score_children`, не в API `Predictor`.
+5. Тренер — пакет `cayleypy/train/` (не `trainers/` — не конфликтовать с #151; кредитовать vlzm в описании PR9).
+6. Симметрии: источник — захардкоженные списки для малых головоломок в `cayleypy/puzzles/moves.py` (конвенция README) + опциональный helper-деривация для малых групп (slow test).
+
+## Technical Details
+
+- `score_children`: семантика «выход/столбец i = применить генератор i»; тест — **поколоночный** (`score_children(s)[:, i] == predict(gen_i(s))` для каждого i отдельно — ловит транспонирование, чего не делает сравнение целых тензоров через общий reshape)
+- батчинг 2-D выходов в `Predictor.__call__`/внутренностях: `torch.cat(dim=0)` вместо `hstack` + тест с батчем > `graph.batch_size`
+- child-scored beam step (PR2): держать соседей в `[n_states, n_gen]`-раскладке, скорить `score_children(parents)`, разворачивать скоры в порядке `get_neighbors`, затем unique/top-k с индексной картой обратно к скорам; провенанс «какой ход породил слот» сохраняется (нужен PR13/PR14); паритет-тест: Q-модель и её скалярный эквивалент дают идентичный луч на `PermutationGroups.lrx(5)`
+- nbt (PR14): реюз `graph_def.generators_inverse_map` (обрабатывать None = не inverse-closed); ценность: бан для `search_simple` (там его нет) и O(1)-память как альтернатива `history_depth=1` для очень широких лучей — цифры в описание PR
+- `LowerBound` (PR15): протокол `lb(states) -> Tensor[B]` (документировать допустимость: lb ≤ истина); `BfsLowerBound` поверх `BfsResult`/`bfs_bitmask`; параметр `prune_above: Optional[int]` — известная верхняя оценка длины (например, из прошлого прогона); None = без отсечения; **одиночный `Optional[LowerBound]`, не список** (второй реализации нет — YAGNI)
+- ансамбль (PR7): плоский `EnsemblePredictor(members, weights)` — без вложенных ансамблей (спекулятивная общность)
+- тренер: `TrainConfig` (frozen dataclass) — rw_length, n_walks, batch, lr, cosine-скедулер, ema_decay, loss (`mse`|`pinball(τ)`|masked-sparse), пропорции смеси данных (anchors default 1–2%)
+
+## What Goes Where
+
+- **Implementation Steps** (`[ ]`): код/тесты/PR в форке + этот план
+- **Post-Completion**: статусы мержей (2 апрува — не в моей власти), бэкенды, миграция чужих весов, анонс
+
+## Implementation Steps
+
+Пути — относительно корня форка `cayleypy`.
+
+### Task 1: Форк, окружение, инвентаризация
+
+**Files:**
+- Create: локальный клон форка
+- Create: `docs/plans/notes/20260803-task1-inventory.md` (зафиксированные сигнатуры + инвентарь upstream-PR) ➕
+
+- [x] `gh repo fork cayleypy/cayleypy --clone`; remote upstream; `pip install -e ".[lint,test]"`; `./lint.sh && RUN_SLOW_TESTS=1 pytest` зелёные на `main` — клон и remotes уже были на месте; окружение поднято через `uv venv --python 3.12 .venv` + `uv pip install -e ".[lint,test,dev]"`; lint зелёный (black 59 файлов, pylint 10.00/10, mypy clean), тесты 299 passed / 12 skipped / 3 xfailed
+- [x] прочитать README «How to contribute» (2 апрува, сброс апрува пушем, имя PR) и «How to add a new predictor model» (модель обязана демонстрировать пользу в beam search + веса на Kaggle) — README.md:162‑178 и :194‑216, выжимка в разделе 2 заметок
+- [x] прочитать целиком `predictor.py`, `models/models.py`, `algo/beam_search.py`, `hasher.py`, `cayley_graph.py::get_neighbors`, `cayley_graph_def.py::generators_inverse_map` — зафиксировать фактические сигнатуры (раздел 3 заметок; generator-major раскладка и `is_identity`-ветка `get_unique_states` подтверждены по коду)
+- [x] инвентаризация открытых upstream-PR, трогающих `beam_search.py`/`predictor.py` (#157, #175, #177, #170) — **read-only**, ничего не постить; заметки для будущей фазы публикации (раздел 4 заметок; добавлены #151 и #188; `predictor.py` трогает только draft #170 — `torch.inference_mode()`)
+- [x] `gh repo set-default stasdiener/cayleypy` в клоне — защита от случайного PR в upstream
+- [x] включить GitHub Actions в форке (вкладка Actions → Enable) — сделано через API (`gh api -X PUT repos/stasdiener/cayleypy/actions/permissions -F enabled=true -f allowed_actions=all`), оба workflow (`ci.yaml`, `deploy-docs.yaml`) в состоянии `active`
+- [x] проверить локальный запуск тестов под Python 3.9 (`uv run -p 3.9 pytest`) — база для PR1; сделано через отдельный `.venv39` (чтобы не пересоздавать основной venv): 3.9.6 + torch 2.8.0, те же 299 passed / 12 skipped / 3 xfailed
+- [x] (design-issue в upstream НЕ открываем — отложено до фазы публикации, см. Post-Completion) — ничего не постилось, в upstream только read-only чтения
+
+### Task 2: PR1 — контракт score_children + ModelConfig v2 + чекпойнт
+
+**Files:**
+- Modify: `cayleypy/predictor.py`, `cayleypy/predictor_test.py`
+- Modify: `cayleypy/models/models.py`
+- Create: `cayleypy/models/checkpoint.py`, `cayleypy/models/checkpoint_test.py`
+- Create: `cayleypy/models/models_test.py`
+- Modify: `cayleypy/__init__.py`, `cayleypy/models/__init__.py`, `docs/api.rst`
+
+- [ ] ветка `feat/score-children-contract`; `Predictor.score_children` с дефолтом через скалярный предикт детей; **учесть generator-major раскладку `get_neighbors` (транспонирование при reshape в `[B, n_gen]`)**
+- [ ] исправить батчинг для 2-D выходов (`torch.cat(dim=0)` вместо `hstack`); guard в legacy `__call__`: 2-D выход модели → понятная ошибка
+- [ ] `ModelConfig`: плоские поля `n_outputs=1`, `tokenizer_groups: Optional=None`, `graph_hash: Optional[str]=None`; явно расширить `from_dict`; `Optional[...]`-синтаксис (3.9)
+- [ ] `checkpoint.py`: save/load (config — примитивы; **`torch.load(..., weights_only=True)` явно**); `graph_hash(graph_def)` c поддержкой perm-списков и `MatrixGenerator` (`matrix.tolist()+modulo`) + `central_state`
+- [ ] экспорт новых символов в `__init__.py`, autosummary в `docs/api.rst`
+- [ ] write tests (success): поколоночный тест score_children на `PermutationGroups.lrx(5)` (`device="cpu"`); round-trip чекпойнта c `weights_only=True`; `from_dict` со старым словарём; батч > `graph.batch_size`
+- [ ] write tests (error/edge): отказ загрузки при неверном `graph_hash`; guard legacy-пути на 2-D модели; matrix-графы в `graph_hash`
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` (и `uv run -p 3.9 pytest`) — must pass before next task
+- [ ] открыть PR в форк (`gh pr create --repo stasdiener/cayleypy`)
+
+### Task 3: PR2 — child-scored beam step (потребитель контракта)
+
+**Files:**
+- Modify: `cayleypy/algo/beam_search.py`, `cayleypy/algo/beam_search_test.py`
+
+- [ ] ветка `feat/child-scored-beam` от PR1; шаг луча: соседи в `[n_states, n_gen]`-раскладке, скоринг `score_children(parents)` до дедупа, unique/top-k через индексную карту; сохранить провенанс «ход, породивший слот»
+- [ ] определить, в какой из путей это входит (`search_simple` и/или `search_advanced`) с учётом судьбы #157 — зафиксировать в PR
+- [ ] опция включения (дефолт — старое поведение), прокинуть через диспатч `search()`
+- [ ] write tests (success): паритет — Q-модель и скалярный эквивалент дают идентичный луч на `lrx(5)`; старый путь без опции не изменился (существующие тесты без правок)
+- [ ] write tests (error/edge): модель c `n_outputs != n_gen` → понятная ошибка; пустой фронтир
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR (base = ветка PR1, Draft до мержа PR1)
+
+### Task 4: PR3 — ResMLP и многовыходной MLP
+
+**Files:**
+- Modify: `cayleypy/models/models.py`, `cayleypy/models/models_test.py`
+- Modify: `cayleypy/models/__init__.py`, `docs/api.rst`
+
+- [ ] ветка `feat/resmlp-qmlp` от PR1; `ResMlpModel` (Linear+LN+ReLU+skip; hidden, n_blocks, n_outputs); `MlpModel` c `n_outputs>1` **без изменения ключей/форм state_dict при n_outputs=1** (совместимость претрейнов)
+- [ ] регистрация в `ModelConfig._build_model` (модуль `models.py`, НЕ `models_lib.py`); типы согласовать с существующим `"MLP"` (uppercase)
+- [ ] быстрый путь `score_children` при `n_outputs == n_gen`
+- [ ] write tests (success): формы выходов; поколоночная эквивалентность быстрого пути и дефолтного; чекпойнт round-trip; `models_lib_test.test_loads_predictor_models` остаётся зелёным
+- [ ] write tests (error/edge): неверный n_outputs vs граф; неизвестный model_type
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR
+
+### Task 5: PR4 — GroupTokenizer
+
+**Files:**
+- Create: `cayleypy/models/tokenizer.py`, `cayleypy/models/tokenizer_test.py`
+- Modify: `cayleypy/models/__init__.py`, `docs/api.rst`
+
+- [ ] ветка `feat/group-tokenizer` от PR1; `GroupTokenizer` по спеке `tokenizer_groups` (для мегаминкса: 20 углов×3 + 30 рёбер×2 → 50 токенов, словарь 60)
+- [ ] write tests (success): корректность на малой головоломке с известной раскладкой
+- [ ] write tests (error/edge): несогласованная спека (сумма групп ≠ длине состояния)
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR
+
+### Task 6: PR5 — Q-трансформер
+
+**Files:**
+- Create: `cayleypy/models/transformer.py`, `cayleypy/models/transformer_test.py`
+- Modify: `cayleypy/models/models.py` (регистрация в `_build_model`), `cayleypy/models/__init__.py`, `docs/api.rst`
+
+- [ ] ветка `feat/q-transformer` от PR4; embedding + learnable pos-encoding + `nn.TransformerEncoder` (SDPA) + голова `n_outputs`; конфиг-пример мегаминкса в докстринге
+- [ ] в описании PR: «веса появятся в PR11 (демонстратор)» — не мёртвый код
+- [ ] write tests (success): форма выхода; чекпойнт round-trip; инвариантность к batch size
+- [ ] write tests (error/edge): вызов без `tokenizer_groups` → понятная ошибка
+- [ ] ➕ (вне CI) скрипт паритета с Kaggle-весами Влада — публичные веса, по прецеденту `models_lib_test` без skipif; пометить slow
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR
+
+### Task 7: PR6 — AZ-модель (q+v) и v-consistency
+
+**Files:**
+- Create: `cayleypy/models/qv_model.py`, `cayleypy/models/qv_model_test.py`
+- Modify: `cayleypy/models/models.py` (регистрация), `cayleypy/models/__init__.py`, `docs/api.rst`
+
+- [ ] ветка `feat/az-heads` от PR3; `QVModel`: бэкбон из фабрики + q-head (`n_gen`) + v-head (1)
+- [ ] v-consistency **внутри `QVModel.score_children`** (inference-time rescoring, не расширение API `Predictor`): штраф `weight * |Q_child − (V_parent − 1)|`
+- [ ] write tests (success): формы голов; на ручном примере штраф понижает ранг ребёнка, чей Q противоречит V−1; чекпойнт с вложенным конфигом бэкбона
+- [ ] write tests (error/edge): weight<0; бэкбон-конфиг неизвестного типа
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR
+
+### Task 8: PR7 — EnsemblePredictor (плоский)
+
+**Files:**
+- Create: `cayleypy/ensemble.py`, `cayleypy/ensemble_test.py`
+- Modify: `cayleypy/__init__.py`, `docs/api.rst`
+
+- [ ] ветка `feat/ensemble-predictor` от PR1; `EnsemblePredictor(members: list, weights: list)` — взвешенная сумма `score_children`; **без вложенных ансамблей**
+- [ ] write tests (success): сумма 0.75/0.25 против ручного расчёта
+- [ ] write tests (error/edge): пустой список; разный `n_gen` у членов; веса не нормируются
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR
+
+### Task 9: PR8 — лоссы (независимый, можно параллельно с PR1)
+
+**Files:**
+- Create: `cayleypy/train/__init__.py`, `cayleypy/train/losses.py`, `cayleypy/train/losses_test.py`
+- Modify: `cayleypy/__init__.py`, `docs/api.rst`
+
+- [ ] ветка `feat/train-losses` от `main`; MSE, pinball(τ), masked-sparse (маска неразмеченных выходов — фундамент PR10)
+- [ ] write tests (success): формулы на синтетике (pinball при τ=0.5 = 0.5·MAE и т.п.); маска не пропускает градиент
+- [ ] write tests (error/edge): τ вне (0,1); маска несовместимой формы
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR
+
+### Task 10: PR9 — тренер-ядро
+
+**Files:**
+- Create: `cayleypy/train/config.py`, `cayleypy/train/trainer.py`, `cayleypy/train/trainer_test.py`
+- Modify: `cayleypy/train/__init__.py`, `docs/api.rst`
+
+- [ ] ветка `feat/trainer-core` от PR8 (+ использует checkpoint из PR1); `TrainConfig` (frozen, 3.9-синтаксис); `Trainer`: данные из `algo/random_walks.py` (nbt-волки), AdamW + CosineAnnealingLR, EMA-копия, сохранение через `checkpoint.py`, прогресс — `verbose` + `print`
+- [ ] в описании PR: ссылка на #151, кредит vlzm, отличия (контракт PR1, лоссы PR8, EMA, ноль новых зависимостей — #151 тянул deps в pyproject)
+- [ ] write tests (success, RUN_SLOW_TESTS): `torch.manual_seed`, тренировка на `lrx(5)`: final loss < 20% initial; beam с обученной моделью решает все состояния (slow tier)
+- [ ] write tests (error/edge, быстрые): чекпойнт-резюме; EMA-обновление на 2 шагах; несовместимый конфиг
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR
+
+### Task 11: PR10 — источники данных: BFSAnchors + SparseQSampler
+
+**Files:**
+- Create: `cayleypy/train/data.py`, `cayleypy/train/data_test.py`
+- Modify: `cayleypy/train/trainer.py`, `cayleypy/train/config.py`
+
+- [ ] ветка `feat/train-data-sources` от PR9; `BFSAnchors(graph, depth)`: семпл глубины ≤ d−1 → все `n_gen` детей в таблице → плотные точные метки; `SparseQSampler`: метки prev(p−1)/next(p+1), остальное маскируется
+- [ ] `PathDataSource`: пути решений (найденные beam search / загруженные, формат совместим с `cayleypy-beam-results` TSV) → hindsight-метки остаточной длины для всех состояний пути (верхние границы — флаг в семпле, чтобы лосс мог их взвешивать)
+- [ ] пропорции смеси в `TrainConfig` (дефолт anchors 1–2% — 10% вредит, эмпирика Стаса)
+- [ ] write tests (success): метки anchors == точный BFS на `lrx(5)`; ровно 2 размеченных выхода у sparse; распределение смеси в батче; hindsight-метки пути == длина хвоста пути
+- [ ] write tests (error/edge): depth-guard по памяти; глубина 0; граф без inverse-closed генераторов для nbt-волков
+- [ ] интеграционный slow-тест: тренировка с anchors даёт точные предсказания на глубинах ≤ d
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR
+
+### Task 12: PR11 — демонстрационный чекпойнт в PREDICTOR_MODELS
+
+**Files:**
+- Modify: `cayleypy/models/models_lib.py`, `cayleypy/models/models_lib_test.py`
+- Modify: `README.md` (форк; при мерже — upstream)
+
+- [ ] обучить тренером (PR9+PR10) небольшую Q-модель (ResMLP или трансформер) на графе типа `lrx(N)`/малой головоломке; проверить по гайду upstream: «reliably finds the paths» в beam search
+- [ ] выгрузить веса на **свой** Kaggle-аккаунт; добавить запись в `PREDICTOR_MODELS`
+- [ ] сослаться на этот PR из описаний PR3/PR5/PR6 («веса здесь») — закрыть вопрос «мёртвого кода»
+- [ ] write tests (success): загрузка новой записи в `models_lib_test` (по прецеденту — публичные веса без skipif)
+- [ ] write tests (error/edge): понятная ошибка при недоступности kagglehub (обёртка, если её нет)
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR
+
+### Task 13: PR12 — SymmetryGroup + TTA
+
+**Files:**
+- Create: `cayleypy/symmetries.py`, `cayleypy/symmetries_test.py`
+- Modify: `cayleypy/puzzles/moves.py` (захардкоженные списки симметрий — конвенция README)
+- Modify: `cayleypy/__init__.py`, `docs/api.rst`
+
+- [ ] ветка `feat/symmetry-group` от PR1; `SymmetryGroup(symmetries, graph_def)`: `apply`, `transport_actions` (sigma_inv), `verify()` (сопряжение генератора симметрией — снова генератор, индексы согласованы)
+- [ ] **источник симметрий**: захардкодить списки для 2×2×2 (+ LRX-отражение) в `puzzles/moves.py`; ➕ опциональный helper-деривация перебором для малых групп (под RUN_SLOW_TESTS)
+- [ ] TTA-обёртка `SymmetrizedPredictor(base, sym_group)`: среднее `score_children` по образам с обратным транспортом индексов
+- [ ] write tests (success): `verify()` на 2×2×2; транспорт индексов против точного BFS; TTA не меняет предсказания симметричной модели
+- [ ] write tests (error/edge): не-симметрия (не сохраняет набор генераторов) ловится `verify()`
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR
+
+### Task 14: PR13 — канонический дедуп в луче
+
+**Files:**
+- Modify: `cayleypy/algo/beam_search.py`, `cayleypy/algo/beam_search_test.py`
+- Modify: `cayleypy/symmetries.py` (метод `canonical`)
+
+- [ ] ветка `feat/canonical-dedup` **от ветки PR2** (нужен провенанс/раскладка) + использует PR12; `canonical(states)`: лексикографический минимум орбиты (батчево, прямой перебор — группы симметрий малы)
+- [ ] опция `canonical_dedup: Optional[SymmetryGroup]` — дедуп фронтира по хэшу канонической формы (через `hasher.py`), прокинуть через `search()`
+- [ ] write tests (success): фронтир сжимается на состояниях-орбитах (малый граф, ручной подсчёт); решение не теряется
+- [ ] write tests (error/edge): дефолт None — поведение не изменилось (существующие тесты)
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR (Draft до мержа PR2/PR12)
+
+### Task 15: PR14 — non-backtracking для search_simple (кандидат на выброс)
+
+**Files:**
+- Modify: `cayleypy/algo/beam_search.py`, `cayleypy/algo/beam_search_test.py`
+
+- [ ] ⚠️ вопрос «нужен ли, учитывая `history_depth` в `search_advanced`?» отложен до фазы публикации; в форке реализуем (ценность: бан для `search_simple`, где его нет, + O(1)-память vs `history_depth=1` на широких лучах) — подавать ли в upstream, решится по замерам
+- [ ] ветка `feat/nbt-simple-beam` **от ветки PR13**; реюз `graph_def.generators_inverse_map` (None = не inverse-closed → опция недоступна, понятная ошибка); бан ребёнка с `move == inv_map[parent_move]` по провенансу из PR2
+- [ ] параметр `non_backtracking: bool = False`
+- [ ] write tests (success): nbt-луч не посещает отменяющие пары (малый граф); результат не хуже на фикс-наборе `lrx(5)`
+- [ ] write tests (error/edge): генераторы-инволюции (inv == сам ход); не-inverse-closed набор
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR + числа сравнения с `history_depth=1` в описании
+
+### Task 16: PR15 — LowerBound-отсечение в луче
+
+**Files:**
+- Create: `cayleypy/lower_bound.py`, `cayleypy/lower_bound_test.py`
+- Modify: `cayleypy/algo/beam_search.py`, `cayleypy/algo/beam_search_test.py`
+- Modify: `cayleypy/__init__.py`, `docs/api.rst`
+
+- [ ] ветка `feat/lower-bound-pruning` (от PR2, либо от `main` если PR2 застрял — логика не зависит от child-scoring); протокол `LowerBound.lb(states)` (докстринг: требование допустимости)
+- [ ] `BfsLowerBound` поверх `BfsResult`/`bfs_bitmask`: в таблице → точно, вне → `depth+1`
+- [ ] опции `lower_bound: Optional[LowerBound]`, `prune_above: Optional[int]` (семантика в докстринге: известная верхняя оценка длины; None = выкл), прокинуть через `search()`
+- [ ] write tests (success): на графе с полным BFS фильтр не отсекает состояния оптимального пути (допустимость); max-эффект при заниженном prune_above
+- [ ] write tests (error/edge): `lower_bound=None` — ноль оверхеда/старое поведение; prune_above < длины решения → честный fail поиска
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR
+
+### Task 17: PR16 — Bellman/DAVI-дообучение
+
+**Files:**
+- Create: `cayleypy/train/bellman.py`, `cayleypy/train/bellman_test.py`
+- Modify: `cayleypy/train/config.py`, `cayleypy/train/__init__.py`, `docs/api.rst`
+
+- [ ] ветка `feat/bellman-finetune` от PR10; режим Bellman в тренере: таргет `y(s) = 1 + min_a V_target(child_a(s))` — векторизованно через `score_children` **замороженной target-копии** (EMA-копия из PR9 переиспользуется); периодическое обновление target
+- [ ] подмешивание anchors в Bellman-батч обязательно (solved таргет 0 + соседи — иначе шкала уплывает; это твоё улучшение 154→139 из ноутбука) — дефолт из `TrainConfig`
+- [ ] режим «дообучение»: старт с RW-претрейна (чекпойнт PR1), пониженный lr — сценарий из версий ноутбука `rw-modelbaselines`
+- [ ] write tests (success): fixed-point — точная V на крошечном графе является неподвижной точкой оператора Bellman; (slow) дообучение RW-претрейна на `lrx(5)` приближает предсказания к точному BFS
+- [ ] write tests (error/edge): без anchors и с нулевым lr шкала не обновляется (санити); несовместимый чекпойнт → понятная ошибка
+- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
+- [ ] открыть PR
+
+### Task 18: Verify acceptance criteria (только подконтрольное автору)
+
+**Files:**
+- Create: ветка `integration/all-features` в форке
+
+- [ ] собрать ветку `integration/all-features` (мерж всех фиче-веток); `./lint.sh && RUN_SLOW_TESTS=1 pytest` зелёные
+- [ ] сквозной сценарий на ней: обучить QVModel на `lrx(5)` (PR9+10), дообучить Bellman-режимом (PR16), чекпойнт (PR1), ансамбль (PR7), beam child-scored (PR2) + канон-дедуп (PR12/13) + LowerBound (PR15) — решает все состояния оптимально (сверка с точным BFS)
+- [ ] существующие тесты репо проходят без правок на каждой фиче-ветке
+- [ ] замечания самопроверки/агент-ревью по каждому PR закрыты или явно отложены (список в Post-Completion)
+- [ ] все 16 PR открыты; таблица статусов заведена в Post-Completion
+
+### Task 19: [Final] Update documentation
+
+**Files:**
+- Modify: `docs/api.rst` (форк — добивка секций, если где-то не добавлено в PR)
+- Modify: `README.md` форка (сниппет «конфиг → обучение → чекпойнт → ансамбль → beam»)
+- Modify: `CLAUDE.md` этого репо (создать, если нет — паттерны работы с upstream-PR)
+- Move: этот план → `docs/plans/completed/`
+
+- [ ] `docs/api.rst`: все новые публичные символы в autosummary, job `build-docs` зелёный
+- [ ] README-сниппет одним блоком
+- [ ] обновить/создать CLAUDE.md с выработанными паттернами (stacked-PR протокол, 3.9-ловушки)
+- [ ] перенести план в `docs/plans/completed/`
+
+## Post-Completion
+
+*Внешние события и чужие решения — без чекбоксов*
+
+**Таблица статусов PR** (вести здесь; мерж требует 2 апрувов и не подконтролен автору):
+
+| PR | Ветка | Статус |
+|---|---|---|
+| PR1 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
+
+**Фаза публикации в upstream (после ручной проверки пользователем; порядок и сроки — его решение):**
+- открыть design-issue в upstream: роадмап, ссылки на #151/#188, вопрос о судьбе #157/#175/#177/#170
+- подавать смерженные в форке PR в upstream по одному (ветки уже готовы; base upstream-PR — только `main` upstream, поэтому строго после мержа родителя)
+- правила upstream: ДВА апрува команды ревьюеров; пуш после апрува сбрасывает апрув — не ребейзить одобренное без необходимости
+- stall-политика: 3 недели без ревью → пинг в TG-чате CayleyPy; 6 недель → группа продолжает жить с форка, серия догонит
+
+**Координация с сообществом:**
+- анонс серии в TG-чате CayleyPy; Влад/Андрей ревьюят свои куски (трансформер, AZ, anchors) — их апрувы приближают правило двух
+- судьба #151 после подачи PR9 в upstream: предложить vlzm закрыть со ссылкой; судьба #157/#175/#177/#170 — выяснить в design-issue на фазе публикации
+- stall-эскалация по протоколу из Development Approach (3 недели / 6 недель)
+
+**Миграция весов (нужны авторы):**
+- конвертация в формат PR1: трансформер Влада (Kaggle Models), MLP Люды (2 датасета), AZ Андрея, веса Кирилла — токенизатор и порядок генераторов восстанавливать с авторами; `infer_config_from_state_dict` для размеров слоёв
+- выложить мигрированные чекпойнты на общий хаб
+
+**Фаза 2 — бэкенды (вне охвата):**
+- адаптер CUDA-луча Ивана (precompiled) — вместе с Иваном (#188 уже его)
+- JAX/TPU-паритет beam-фич (nbt, канон-дедуп, LowerBound)
+- MITM-beam поверх `algo/bfs_mitm.py`
+- список `LowerBound`-ов c max-комбинацией — когда появится вторая реализация (PDB)
+
+**Ручная верификация:**
+- паритет Q-трансформера с оригинальными весами Влада (скрипт из Task 6)
+- бенчмарк канон-дедупа и nbt на мегаминксе, луч 2^16, GPU — сравнение средней длины с бейзлайном
