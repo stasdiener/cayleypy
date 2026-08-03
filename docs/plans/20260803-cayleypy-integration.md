@@ -162,15 +162,16 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 
 **Files:**
 - Modify: `cayleypy/models/models.py`, `cayleypy/models/models_test.py`
+- Modify: `cayleypy/predictor.py`, `cayleypy/predictor_test.py` (быстрый путь живёт в `score_children`) ➕
 - Modify: `cayleypy/models/__init__.py`, `docs/api.rst`
 
-- [ ] ветка `feat/resmlp-qmlp` от PR1; `ResMlpModel` (Linear+LN+ReLU+skip; hidden, n_blocks, n_outputs); `MlpModel` c `n_outputs>1` **без изменения ключей/форм state_dict при n_outputs=1** (совместимость претрейнов)
-- [ ] регистрация в `ModelConfig._build_model` (модуль `models.py`, НЕ `models_lib.py`); типы согласовать с существующим `"MLP"` (uppercase)
-- [ ] быстрый путь `score_children` при `n_outputs == n_gen`
-- [ ] write tests (success): формы выходов; поколоночная эквивалентность быстрого пути и дефолтного; чекпойнт round-trip; `models_lib_test.test_loads_predictor_models` остаётся зелёным
-- [ ] write tests (error/edge): неверный n_outputs vs граф; неизвестный model_type
-- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
-- [ ] открыть PR
+- [x] ветка `feat/resmlp-qmlp` от PR1; `ResMlpModel` (Linear+LN+ReLU+skip; hidden, n_blocks, n_outputs); `MlpModel` c `n_outputs>1` **без изменения ключей/форм state_dict при n_outputs=1** (совместимость претрейнов) — `n_blocks`/`hidden` берутся из существующего `layers_sizes` (новых полей конфига не нужно): блоков `len(layers_sizes)`, i-й шириной `layers_sizes[i]`; skip есть у всех блоков, кроме меняющих число фич (первый — проекция из one-hot), т.е. `[512, 512, 512]` = проекция + 2 residual-блока; у `MlpModel` последний слой стал `Linear(in, n_outputs)` — при `n_outputs=1` формы и ключи (`layers.N.*`) не изменились
+- [x] регистрация в `ModelConfig._build_model` (модуль `models.py`, НЕ `models_lib.py`); типы согласовать с существующим `"MLP"` (uppercase) — тип `"RESMLP"` в `ModelConfig.build_model` (переименован в PR1); экспорт `MlpModel`/`ResMlpModel` из `cayleypy/models/__init__.py` + 2 записи в `docs/api.rst`
+- [x] быстрый путь `score_children` при `n_outputs == n_gen` — диспетчеризация по атрибуту `n_outputs` модели (`Predictor.n_outputs = getattr(model, "n_outputs", 1)`; модели из фабрики выставляют его сами, конвенция задокументирована в докстринге `Predictor`): один forward по родителям вместо `n_gen` forward'ов по детям; выход валидируется по форме `[n_states, n_gen]`
+- [x] write tests (success): формы выходов; поколоночная эквивалентность быстрого пути и дефолтного; чекпойнт round-trip; `models_lib_test.test_loads_predictor_models` остаётся зелёным — 12 новых тестов: формы для обеих архитектур при 1 и 3 выходах, совместимость state_dict (точный набор ключей + форма головы `[1, hidden]`), skip-связь (блок с занулёнными весами = тождественная функция), инвариантность к batch size, round-trip чекпойнта для `MLP` и `RESMLP`, поколоночное совпадение быстрого пути с дефолтным (хэмминг-Q-модель против эвристики `"hamming"`, плюс ассерт «модель вызвана 1 раз»), Q-модель из конфига; `models_lib_test.test_loads_predictor_models` зелёный (реальные Kaggle-веса)
+- [x] write tests (error/edge): неверный n_outputs vs граф; неизвестный model_type — плюс `n_outputs <= 0`, пустой `layers_sizes` для RESMLP, форма выхода противоречит заявленному `n_outputs`; ➕ **существующий тест `test_score_children_rejects_2d_output` заменён** (`test_score_children_rejects_wrong_number_of_outputs`): он фиксировал ровно то ограничение, которое снимает PR3
+- [x] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task — lint зелёный (black 62, pylint 10.00/10, mypy 62 файла), `black --check .` по всему репо зелёный, `docs/build_docs.sh` (`-W`) зелёный; `RUN_SLOW_TESTS=1 pytest` = **335 passed / 12 skipped / 3 xfailed** и на 3.12 (torch 2.13), и на 3.9 (`.venv39`, torch 2.8)
+- [x] открыть PR — [stasdiener/cayleypy#3](https://github.com/stasdiener/cayleypy/pull/3), Draft, base `feat/score-children-contract`, в upstream не отправлялось
 
 ### Task 5: PR4 — GroupTokenizer
 
@@ -381,7 +382,8 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 |---|---|---|
 | PR1 | `feat/score-children-contract` | open в форке — [#1](https://github.com/stasdiener/cayleypy/pull/1) (base = `main` форка) |
 | PR2 | `feat/child-scored-beam` | draft в форке — [#2](https://github.com/stasdiener/cayleypy/pull/2) (base = `feat/score-children-contract`; Draft до мержа PR1) |
-| PR3 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
+| PR3 | `feat/resmlp-qmlp` | draft в форке — [#3](https://github.com/stasdiener/cayleypy/pull/3) (base = `feat/score-children-contract`; Draft до мержа PR1) |
+| PR4 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
 
 **Фаза публикации в upstream (после ручной проверки пользователем; порядок и сроки — его решение):**
 - открыть design-issue в upstream: роадмап, ссылки на #151/#188, вопрос о судьбе #157/#175/#177/#170
