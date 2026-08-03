@@ -150,13 +150,13 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 **Files:**
 - Modify: `cayleypy/algo/beam_search.py`, `cayleypy/algo/beam_search_test.py`
 
-- [ ] ветка `feat/child-scored-beam` от PR1; шаг луча: соседи в `[n_states, n_gen]`-раскладке, скоринг `score_children(parents)` до дедупа, unique/top-k через индексную карту; сохранить провенанс «ход, породивший слот»
-- [ ] определить, в какой из путей это входит (`search_simple` и/или `search_advanced`) с учётом судьбы #157 — зафиксировать в PR
-- [ ] опция включения (дефолт — старое поведение), прокинуть через диспатч `search()`
-- [ ] write tests (success): паритет — Q-модель и скалярный эквивалент дают идентичный луч на `lrx(5)`; старый путь без опции не изменился (существующие тесты без правок)
-- [ ] write tests (error/edge): модель c `n_outputs != n_gen` → понятная ошибка; пустой фронтир
-- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
-- [ ] открыть PR (base = ветка PR1, Draft до мержа PR1)
+- [x] ветка `feat/child-scored-beam` от PR1; шаг луча: соседи в `[n_states, n_gen]`-раскладке, скоринг `score_children(parents)` до дедупа, unique/top-k через индексную карту; сохранить провенанс «ход, породивший слот» — новая приватная функция `_expand_layer(graph, states) -> _ExpandedLayer(states, hashes, moves, source_index)` в `beam_search.py`: дедуп идентичен `get_unique_states` (сорт по хэшу + первое вхождение), но дополнительно отдаёт `source_index` (индекс в generator-major выходе `get_neighbors` — по нему берётся скор) и `moves` (ид генератора = `source_index // n_states`); скоры считаются `_score_children` = `predictor.score_children(parents)` + транспонирование в порядок `get_neighbors`
+- [x] определить, в какой из путей это входит (`search_simple` и/или `search_advanced`) с учётом судьбы #157 — зафиксировать в PR — **решение: только `search_simple`**; в `search_advanced` состояния дополнительно фильтруются по хэшам прошлых уровней (пришлось бы переиндексировать скоры), и именно этот цикл переписывает неслитый #157; к тому же провенанс нужен PR13/PR14 именно в `search_simple`. Зафиксировано в описании PR и в тексте ошибки
+- [x] опция включения (дефолт — старое поведение), прокинуть через диспатч `search()` — `use_child_scores: bool = False` в `search()` и `search_simple()`; при `beam_mode="advanced"` — понятная ошибка; при `False` выполняется ровно старый код (ветка `expanded is None`)
+- [x] write tests (success): паритет — Q-модель и скалярный эквивалент дают идентичный луч на `lrx(5)`; старый путь без опции не изменился (существующие тесты без правок) — паритет сделан на `lrx(8)` (на `lrx(5)` луч не обрезается — скоринг вообще не вызывается): Q-модель (хэмминг всех детей за один вызов) против `Predictor(graph, "hamming")` — совпадают путь и `debug_scores`; плюс тест «тот же предиктор с опцией и без» на успешном поиске и на 50-шаговом неуспешном (>40 сравниваемых шагов); плюс тест провенанса (применение `moves[i]` к родителю воспроизводит состояние, `states`/`hashes` равны `get_unique_states`); существующие тесты не правились
+- [x] write tests (error/edge): модель c `n_outputs != n_gen` → понятная ошибка; пустой фронтир — плюс `use_child_scores` в режиме "advanced" → понятная ошибка. Пустой фронтир проверен на `_expand_layer`/`_score_children` (в самом `search_simple` он недостижим); ⚠️ с дефолтным `Predictor.score_children` пустой вход падает в `StringEncoder.encode` (`torch.min` по пустому тензору, `string_encoder.py:52`) — **предсуществующий баг upstream, не в охвате PR2** (скалярный путь падает там же), поэтому тест использует предиктор без переэнкодинга
+- [x] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task — lint зелёный (black 62, pylint 10.00/10, mypy 62 файла), `black --check .` по всему репо зелёный, `docs/build_docs.sh` (`-W`) зелёный; `RUN_SLOW_TESTS=1 pytest` = **330 passed / 12 skipped / 3 xfailed** и на 3.12 (torch 2.13), и на 3.9 (`.venv39`, torch 2.8)
+- [x] открыть PR (base = ветка PR1, Draft до мержа PR1) — [stasdiener/cayleypy#2](https://github.com/stasdiener/cayleypy/pull/2), Draft, base `feat/score-children-contract`, в upstream не отправлялось
 
 ### Task 4: PR3 — ResMLP и многовыходной MLP
 
@@ -380,7 +380,8 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 | PR | Ветка | Статус |
 |---|---|---|
 | PR1 | `feat/score-children-contract` | open в форке — [#1](https://github.com/stasdiener/cayleypy/pull/1) (base = `main` форка) |
-| PR2 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
+| PR2 | `feat/child-scored-beam` | draft в форке — [#2](https://github.com/stasdiener/cayleypy/pull/2) (base = `feat/score-children-contract`; Draft до мержа PR1) |
+| PR3 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
 
 **Фаза публикации в upstream (после ручной проверки пользователем; порядок и сроки — его решение):**
 - открыть design-issue в upstream: роадмап, ссылки на #151/#188, вопрос о судьбе #157/#175/#177/#170
