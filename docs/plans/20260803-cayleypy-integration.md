@@ -192,14 +192,16 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 **Files:**
 - Create: `cayleypy/models/transformer.py`, `cayleypy/models/transformer_test.py`
 - Modify: `cayleypy/models/models.py` (регистрация в `_build_model`), `cayleypy/models/__init__.py`, `docs/api.rst`
+- Modify: `cayleypy/models/tokenizer.py` (импорт `ModelConfig` только под `TYPE_CHECKING`) ➕
+- Create: `docs/plans/notes/20260804-task6-transformer-parity.md` (архитектура донора + статус паритета) ➕
 
-- [ ] ветка `feat/q-transformer` от PR4; embedding + learnable pos-encoding + `nn.TransformerEncoder` (SDPA) + голова `n_outputs`; конфиг-пример мегаминкса в докстринге
-- [ ] в описании PR: «веса появятся в PR11 (демонстратор)» — не мёртвый код
-- [ ] write tests (success): форма выхода; чекпойнт round-trip; инвариантность к batch size
-- [ ] write tests (error/edge): вызов без `tokenizer_groups` → понятная ошибка
-- [ ] ➕ (вне CI) скрипт паритета с Kaggle-весами Влада — публичные веса, по прецеденту `models_lib_test` без skipif; пометить slow
-- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
-- [ ] открыть PR
+- [x] ветка `feat/q-transformer` от PR4; embedding + learnable pos-encoding + `nn.TransformerEncoder` (SDPA) + голова `n_outputs`; конфиг-пример мегаминкса в докстринге — `TransformerModel` (`model_type="TRANSFORMER"`): эмбеддинг токенов `GroupTokenizer` + learnable позиционный эмбеддинг + эмбеддинг типа токена (углы/рёбра различимы) → `nn.TransformerEncoder` (pre-norm, gelu, dropout 0 → детерминизм в eval) → среднее по токенам → `Linear(d_model, n_outputs)`; ➕ **скоуп: 2 новых поля `ModelConfig`** — `n_heads: Optional[int]=None` (дефолт: одна голова на 64 фичи) и `dim_feedforward: Optional[int]=None` (дефолт: 4× ширина), иначе конфиг Влада (8 голов при d_model=256) невыразим, а чекпойнт обязан полностью описывать модель; `layers_sizes` = по записи на слой энкодера, все равны (у энкодера одна ширина во всех слоях), `num_classes_for_one_hot` не используется (словарь задаёт токенизатор); ➕ `tokenizer.py` переведён на `TYPE_CHECKING`-импорт `ModelConfig` — иначе `models.py → transformer.py → tokenizer.py → models.py` циклический импорт (pylint `cyclic-import`)
+- [x] в описании PR: «веса появятся в PR11 (демонстратор)» — не мёртвый код — абзац «Weights» в описании [#5](https://github.com/stasdiener/cayleypy/pull/5)
+- [x] write tests (success): форма выхода; чекпойнт round-trip; инвариантность к batch size — 8 тестов: формы для 1 выхода и Q-варианта (батч и одиночное состояние), конфиг мегаминкса (50 токенов, словарь 60, 2 типа токенов, число слоёв), дефолты голов/FF, независимость выхода от размера батча (полный батч vs по одному), round-trip чекпойнта (включая `n_heads`/`dim_feedforward` в конфиге и `graph_hash`), работа как `Predictor` (`__call__` + дефолтный `score_children`)
+- [x] write tests (error/edge): вызов без `tokenizer_groups` → понятная ошибка — плюс спека групп vs `input_size`, пустой `layers_sizes`, слои разной ширины, ширина не делится на число голов, неположительные `n_heads`/`dim_feedforward`/`n_outputs`
+- [x] ➕ (вне CI) скрипт паритета с Kaggle-весами Влада — публичные веса, по прецеденту `models_lib_test` без skipif; пометить slow — **не сделан, заблокирован внешними данными** (перенесён в Post-Completion → «Миграция весов»): в репозитории донора нет ни одного упоминания Kaggle (проверены `README.md`, `DESIGN.md`, `PROVENANCE.md`, `models.py`, `config.py`, `cli.py`, `configs/`) — id весов неизвестен; и его `PieceTransformer` параметризован иначе (эмбеддинг **каждого** стикера детали + `Linear`-проекция, CLS-пулинг, silu, самописные блоки), поэтому его state_dict не ложится на нашу модель без конверсии, согласованной с автором. Архитектура донора и план конверсии зафиксированы в `docs/plans/notes/20260804-task6-transformer-parity.md`
+- [x] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task — lint зелёный (black 66, pylint 10.00/10 без сообщений, mypy 66 файлов), `black --check .` по всему репо зелёный, `docs/build_docs.sh` (`-W`) зелёный, докстринг-примеры проходят `pytest --doctest-modules`; `RUN_SLOW_TESTS=1 pytest` = **350 passed / 12 skipped / 3 xfailed** и на 3.12 (torch 2.13), и на 3.9 (`.venv39`, torch 2.8)
+- [x] открыть PR — [stasdiener/cayleypy#5](https://github.com/stasdiener/cayleypy/pull/5), Draft, base `feat/group-tokenizer`, в upstream не отправлялось
 
 ### Task 7: PR6 — AZ-модель (q+v) и v-consistency
 
@@ -386,7 +388,8 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 | PR2 | `feat/child-scored-beam` | draft в форке — [#2](https://github.com/stasdiener/cayleypy/pull/2) (base = `feat/score-children-contract`; Draft до мержа PR1) |
 | PR3 | `feat/resmlp-qmlp` | draft в форке — [#3](https://github.com/stasdiener/cayleypy/pull/3) (base = `feat/score-children-contract`; Draft до мержа PR1) |
 | PR4 | `feat/group-tokenizer` | draft в форке — [#4](https://github.com/stasdiener/cayleypy/pull/4) (base = `feat/score-children-contract`; Draft до мержа PR1) |
-| PR5 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
+| PR5 | `feat/q-transformer` | draft в форке — [#5](https://github.com/stasdiener/cayleypy/pull/5) (base = `feat/group-tokenizer`; Draft до мержа PR4) |
+| PR6 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
 
 **Фаза публикации в upstream (после ручной проверки пользователем; порядок и сроки — его решение):**
 - открыть design-issue в upstream: роадмап, ссылки на #151/#188, вопрос о судьбе #157/#175/#177/#170
@@ -401,6 +404,7 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 
 **Миграция весов (нужны авторы):**
 - конвертация в формат PR1: трансформер Влада (Kaggle Models), MLP Люды (2 датасета), AZ Андрея, веса Кирилла — токенизатор и порядок генераторов восстанавливать с авторами; `infer_config_from_state_dict` для размеров слоёв
+- ⚠️ **паритет Q-трансформера (перенесено из Task 6)**: id весов Влада на Kaggle нигде не опубликован, а его `PieceTransformer` параметризован иначе, чем `TransformerModel` (PR5) — нужен либо переобученный чекпойнт (PR11), либо опция «эмбеддить все стикеры детали» в конфиге; детали и план конверсии — `docs/plans/notes/20260804-task6-transformer-parity.md`
 - выложить мигрированные чекпойнты на общий хаб
 
 **Фаза 2 — бэкенды (вне охвата):**
