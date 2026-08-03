@@ -224,11 +224,11 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 - Create: `cayleypy/ensemble.py`, `cayleypy/ensemble_test.py`
 - Modify: `cayleypy/__init__.py`, `docs/api.rst`
 
-- [ ] ветка `feat/ensemble-predictor` от PR1; `EnsemblePredictor(members: list, weights: list)` — взвешенная сумма `score_children`; **без вложенных ансамблей**
-- [ ] write tests (success): сумма 0.75/0.25 против ручного расчёта
-- [ ] write tests (error/edge): пустой список; разный `n_gen` у членов; веса не нормируются
-- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
-- [ ] открыть PR
+- [x] ветка `feat/ensemble-predictor` от PR1; `EnsemblePredictor(members: list, weights: list)` — взвешенная сумма `score_children`; **без вложенных ансамблей** — класс наследует `Predictor` (значит, его можно передать в `beam_search` как есть) и ансамблирует **оба** метода скоринга: `__call__` (скоры самих состояний) и `score_children` (скоры детей — спрашивая у каждого члена его собственный `score_children`, поэтому члены с быстрым однопроходным `score_children` (Q-модели) продолжают им пользоваться); ➕ **веса опциональны**: дефолт `1/n` (среднее членов), заданные веса используются как есть и **не нормируются** (задокументировано); валидация — непустой список, число весов, члены суть `Predictor`-ы для одного графа (совпадают `n_generators` и `state_size`)
+- [x] write tests (success): сумма 0.75/0.25 против ручного расчёта — 13 тестов в `ensemble_test.py`: литеральные ожидаемые числа для 0.75/0.25, поколоночная проверка ансамблированного `score_children`, ансамбль из одного члена == сам член, дефолтные веса дают среднее, делегирование в `score_children` члена (с ассертом «вызван ровно 1 раз»), батчинг обоих методов при состояниях, не влезающих в один батч, ансамбль как предиктор в beam search на `lrx(8)` (путь найден и проверен применением к старту)
+- [x] write tests (error/edge): пустой список; разный `n_gen` у членов; веса не нормируются — плюс неверное число весов, разный `state_size` у членов, член не `Predictor` (понятная ошибка «оберните в Predictor»); «веса не нормируются» — отдельный тест: `[2.0, 3.0]` даёт `2a+3b`, а не `(2a+3b)/5`
+- [x] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task — lint зелёный (black 64, pylint 10.00/10, mypy 64 файла), `black --check .` по всему репо зелёный, `docs/build_docs.sh` (`-W`) зелёный, докстринг-пример проходит `pytest --doctest-modules`; `RUN_SLOW_TESTS=1 pytest` = **336 passed / 12 skipped / 3 xfailed** и на 3.12 (torch 2.13), и на 3.9 (`.venv39`, torch 2.8)
+- [x] открыть PR — [stasdiener/cayleypy#7](https://github.com/stasdiener/cayleypy/pull/7), Draft, base `feat/score-children-contract`, в upstream не отправлялось
 
 ### Task 9: PR8 — лоссы (независимый, можно параллельно с PR1)
 
@@ -392,7 +392,8 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 | PR4 | `feat/group-tokenizer` | draft в форке — [#4](https://github.com/stasdiener/cayleypy/pull/4) (base = `feat/score-children-contract`; Draft до мержа PR1) |
 | PR5 | `feat/q-transformer` | draft в форке — [#5](https://github.com/stasdiener/cayleypy/pull/5) (base = `feat/group-tokenizer`; Draft до мержа PR4) |
 | PR6 | `feat/az-heads` | draft в форке — [#6](https://github.com/stasdiener/cayleypy/pull/6) (base = `feat/resmlp-qmlp`; Draft до мержа PR3) |
-| PR7 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
+| PR7 | `feat/ensemble-predictor` | draft в форке — [#7](https://github.com/stasdiener/cayleypy/pull/7) (base = `feat/score-children-contract`; Draft до мержа PR1) |
+| PR8 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
 
 **Фаза публикации в upstream (после ручной проверки пользователем; порядок и сроки — его решение):**
 - открыть design-issue в upstream: роадмап, ссылки на #151/#188, вопрос о судьбе #157/#175/#177/#170
