@@ -135,15 +135,15 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 - Create: `cayleypy/models/models_test.py`
 - Modify: `cayleypy/__init__.py`, `cayleypy/models/__init__.py`, `docs/api.rst`
 
-- [ ] ветка `feat/score-children-contract`; `Predictor.score_children` с дефолтом через скалярный предикт детей; **учесть generator-major раскладку `get_neighbors` (транспонирование при reshape в `[B, n_gen]`)**
-- [ ] исправить батчинг для 2-D выходов (`torch.cat(dim=0)` вместо `hstack`); guard в legacy `__call__`: 2-D выход модели → понятная ошибка
-- [ ] `ModelConfig`: плоские поля `n_outputs=1`, `tokenizer_groups: Optional=None`, `graph_hash: Optional[str]=None`; явно расширить `from_dict`; `Optional[...]`-синтаксис (3.9)
-- [ ] `checkpoint.py`: save/load (config — примитивы; **`torch.load(..., weights_only=True)` явно**); `graph_hash(graph_def)` c поддержкой perm-списков и `MatrixGenerator` (`matrix.tolist()+modulo`) + `central_state`
-- [ ] экспорт новых символов в `__init__.py`, autosummary в `docs/api.rst`
-- [ ] write tests (success): поколоночный тест score_children на `PermutationGroups.lrx(5)` (`device="cpu"`); round-trip чекпойнта c `weights_only=True`; `from_dict` со старым словарём; батч > `graph.batch_size`
-- [ ] write tests (error/edge): отказ загрузки при неверном `graph_hash`; guard legacy-пути на 2-D модели; matrix-графы в `graph_hash`
-- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` (и `uv run -p 3.9 pytest`) — must pass before next task
-- [ ] открыть PR в форк (`gh pr create --repo stasdiener/cayleypy`)
+- [x] ветка `feat/score-children-contract`; `Predictor.score_children` с дефолтом через скалярный предикт детей; **учесть generator-major раскладку `get_neighbors` (транспонирование при reshape в `[B, n_gen]`)** — `predictor.py`: `reshape((n_gen, num_states)).transpose(0, 1).contiguous()`; число состояний берётся из `encode_states(...)`, поэтому 1-D вход (одно состояние) тоже корректен
+- [x] исправить батчинг для 2-D выходов (`torch.cat(dim=0)` вместо `hstack`); guard в legacy `__call__`: 2-D выход модели → понятная ошибка — ➕ батчинг вынесен в публичный `Predictor.predict_batched` (возвращает сырой выход модели, 1-D или 2-D), а `__call__` = `predict_batched` + проверка `len(ans.shape) != 1`; так guard в одном месте, а PR3/PR6/PR7 получают готовую точку входа для многовыходных моделей
+- [x] `ModelConfig`: плоские поля `n_outputs=1`, `tokenizer_groups: Optional=None`, `graph_hash: Optional[str]=None`; явно расширить `from_dict`; `Optional[...]`-синтаксис (3.9) — плюс `to_dict()` (через `dataclasses.asdict`, только примитивы) для чекпойнта; `tokenizer_groups` — `Optional[list[list[int]]]`, пары `[group_size, num_groups]` (мегаминкс = `[[3, 20], [2, 30]]`), семантика зафиксирована в докстринге для PR4; `MlpModel` при `n_outputs != 1` даёт понятную ошибку (многовыходной MLP — PR3)
+- [x] `checkpoint.py`: save/load (config — примитивы; **`torch.load(..., weights_only=True)` явно**); `graph_hash(graph_def)` c поддержкой perm-списков и `MatrixGenerator` (`matrix.tolist()+modulo`) + `central_state` — формат `{format_version, config, state_dict}`, отказ на голом state_dict и на версии формата из будущего; `CayleyGraphDef` импортируется только под `TYPE_CHECKING` (ветвление через `is_permutation_group()`) — ноль рантайм-связи с родительским пакетом; ➕ **скоуп: `ModelConfig._build_model` переименован в публичный `build_model`** (нужен загрузчику чекпойнта; иначе protected-access-варнинг pylint, который по README чинят, а не отключают) — регистрация новых типов моделей в PR3/PR5/PR6 идёт в него, по-прежнему в `models.py`; `ModelConfig.load` тоже получил явный `weights_only=True`
+- [x] экспорт новых символов в `__init__.py`, autosummary в `docs/api.rst` — `cayleypy/models/__init__.py`: `graph_hash`, `save_checkpoint`, `load_checkpoint`; `cayleypy/__init__.py`: `ModelConfig`, `save_checkpoint`, `load_checkpoint`; api.rst — 3 записи в «Beam search and ML»; `docs/build_docs.sh` собирается с `-W`
+- [x] write tests (success): поколоночный тест score_children на `PermutationGroups.lrx(5)` (`device="cpu"`); round-trip чекпойнта c `weights_only=True`; `from_dict` со старым словарём; батч > `graph.batch_size` — `predictor_test.py` (+7 тестов: поколоночный на 4 состояниях со sanity-проверкой различности столбцов, одиночное состояние, дети не влезают в один батч, 2-D выход выживает батчинг), `models/models_test.py` (7), `models/checkpoint_test.py` (9, включая матричный граф и `to_dict`→JSON)
+- [x] write tests (error/edge): отказ загрузки при неверном `graph_hash`; guard legacy-пути на 2-D модели; matrix-графы в `graph_hash` — плюс голый state_dict, версия формата из будущего, неизвестный `model_type`, `n_outputs != 1` для MLP, `graph_hash` не меняется от `with_name` и меняется от генераторов/central_state/modulo
+- [x] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` (и `uv run -p 3.9 pytest`) — must pass before next task — lint зелёный (black 62 файла, pylint 10.00/10, mypy 62 файла), `black --check .` по всему репо зелёный; `RUN_SLOW_TESTS=1 pytest` = **323 passed / 12 skipped / 3 xfailed** и на 3.12 (torch 2.13), и на 3.9 (`.venv39`, torch 2.8); `models_lib_test.test_loads_predictor_models` зелёный (совместимость Kaggle-весов)
+- [x] открыть PR в форк (`gh pr create --repo stasdiener/cayleypy`) — [stasdiener/cayleypy#1](https://github.com/stasdiener/cayleypy/pull/1), base `main` форка, в upstream не отправлялось
 
 ### Task 3: PR2 — child-scored beam step (потребитель контракта)
 
@@ -379,7 +379,8 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 
 | PR | Ветка | Статус |
 |---|---|---|
-| PR1 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
+| PR1 | `feat/score-children-contract` | open в форке — [#1](https://github.com/stasdiener/cayleypy/pull/1) (base = `main` форка) |
+| PR2 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
 
 **Фаза публикации в upstream (после ручной проверки пользователем; порядок и сроки — его решение):**
 - открыть design-issue в upstream: роадмап, ссылки на #151/#188, вопрос о судьбе #157/#175/#177/#170
