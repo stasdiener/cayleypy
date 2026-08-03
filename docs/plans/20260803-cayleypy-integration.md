@@ -236,11 +236,11 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 - Create: `cayleypy/train/__init__.py`, `cayleypy/train/losses.py`, `cayleypy/train/losses_test.py`
 - Modify: `cayleypy/__init__.py`, `docs/api.rst`
 
-- [ ] ветка `feat/train-losses` от `main`; MSE, pinball(τ), masked-sparse (маска неразмеченных выходов — фундамент PR10)
-- [ ] write tests (success): формулы на синтетике (pinball при τ=0.5 = 0.5·MAE и т.п.); маска не пропускает градиент
-- [ ] write tests (error/edge): τ вне (0,1); маска несовместимой формы
-- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
-- [ ] открыть PR
+- [x] ветка `feat/train-losses` от `main`; MSE, pinball(τ), masked-sparse (маска неразмеченных выходов — фундамент PR10) — `Loss` (ABC: подклассы реализуют только `elementwise`, общий `__call__` делает валидацию и редукцию), `MseLoss`, `PinballLoss(tau)` (τ-квантиль: при τ<0.5 предсказания смещаются к нижней оценке, при τ=0.5 = ½·MAE), `make_loss(name, tau)` для конфига тренера; ➕ **скоуп: masked-sparse — не третий класс лосса, а параметр `mask` у обоих** (маскирование ортогонально поэлементной формуле: «masked sparse MSE» = `MseLoss()(pred, targets, mask=mask)`); ➕ **добавлен `weights`** (взвешенное среднее) — PR10 требует «верхние границы взвешивать», а `losses.py` в списке файлов PR10 нет, значит поддержка нужна здесь; лоссы **не** `nn.Module` (нет обучаемых параметров — не мусорить в state_dict, как `GroupTokenizer` в PR4); пустой mask → 0 и нулевой (не NaN) градиент через `clamp_min` знаменателя
+- [x] write tests (success): формулы на синтетике (pinball при τ=0.5 = 0.5·MAE и т.п.); маска не пропускает градиент — 26 тестов (включая 3 doctest'а): формулы против ручного счёта и против `torch.nn.functional` (`mse_loss`, `0.5·l1_loss`), асимметрия при τ=0.9/0.1 с литеральными числами, минимум pinball ровно в квантиле целей, маска игнорирует неразмеченные элементы даже при целях `1e9`, градиент строго нулевой в маскированных позициях, полностью маскированный батч → 0 и нулевой градиент, bool- и числовая маски совпадают, веса (ручные числа, отсутствие нормировки, комбинация с маской), Q-форма `[B, n_gen]`, целочисленные цели (BFS), тренировочная санити с сидом (final loss < 20% initial для всех трёх лоссов; маскированная тренировка двигает только размеченный выход)
+- [x] write tests (error/edge): τ вне (0,1); маска несовместимой формы — τ = 0, 1, −0.5, 1.5, NaN; неизвестное имя в `make_loss`; несовпадение формы targets/mask/weights с predictions (в т.ч. то же число элементов при другой форме — там бы бродкаст молча дал неверный ответ)
+- [x] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task — lint зелёный (black 62, pylint 10.00/10, mypy 62 файла), `black --check .` по всему репо зелёный, `docs/build_docs.sh` (`-W`) зелёный; `RUN_SLOW_TESTS=1 pytest` = **322 passed / 12 skipped / 3 xfailed** и на 3.12 (torch 2.13), и на 3.9 (`.venv39`, torch 2.8)
+- [x] открыть PR — [stasdiener/cayleypy#8](https://github.com/stasdiener/cayleypy/pull/8), base `main` форка (PR независим от PR1 — не Draft), в upstream не отправлялось
 
 ### Task 10: PR9 — тренер-ядро
 
@@ -393,7 +393,8 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 | PR5 | `feat/q-transformer` | draft в форке — [#5](https://github.com/stasdiener/cayleypy/pull/5) (base = `feat/group-tokenizer`; Draft до мержа PR4) |
 | PR6 | `feat/az-heads` | draft в форке — [#6](https://github.com/stasdiener/cayleypy/pull/6) (base = `feat/resmlp-qmlp`; Draft до мержа PR3) |
 | PR7 | `feat/ensemble-predictor` | draft в форке — [#7](https://github.com/stasdiener/cayleypy/pull/7) (base = `feat/score-children-contract`; Draft до мержа PR1) |
-| PR8 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
+| PR8 | `feat/train-losses` | open в форке — [#8](https://github.com/stasdiener/cayleypy/pull/8) (base = `main` форка; независим от PR1) |
+| PR9 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
 
 **Фаза публикации в upstream (после ручной проверки пользователем; порядок и сроки — его решение):**
 - открыть design-issue в upstream: роадмап, ссылки на #151/#188, вопрос о судьбе #157/#175/#177/#170
