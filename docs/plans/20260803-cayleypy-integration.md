@@ -277,14 +277,17 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 **Files:**
 - Modify: `cayleypy/models/models_lib.py`, `cayleypy/models/models_lib_test.py`
 - Modify: `README.md` (форк; при мерже — upstream)
+- Modify: `cayleypy/models/models.py`, `cayleypy/models/models_test.py` (`ModelConfig.load` — форматы весов + обёртка ошибок Kaggle) ➕
+- Modify: `cayleypy/predictor.py` (сверка `graph_hash` в `Predictor.pretrained`) ➕
+- Create: `docs/plans/notes/20260804-task12-demo-checkpoint.md` (рецепт, замеры, пределы рецепта) ➕
 
-- [ ] обучить тренером (PR9+PR10) небольшую Q-модель (ResMLP или трансформер) на графе типа `lrx(N)`/малой головоломке; проверить по гайду upstream: «reliably finds the paths» в beam search
-- [ ] выгрузить веса на **свой** Kaggle-аккаунт; добавить запись в `PREDICTOR_MODELS`
-- [ ] сослаться на этот PR из описаний PR3/PR5/PR6 («веса здесь») — закрыть вопрос «мёртвого кода»
-- [ ] write tests (success): загрузка новой записи в `models_lib_test` (по прецеденту — публичные веса без skipif)
-- [ ] write tests (error/edge): понятная ошибка при недоступности kagglehub (обёртка, если её нет)
-- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
-- [ ] открыть PR
+- [x] обучить тренером (PR9+PR10) небольшую Q-модель (ResMLP или трансформер) на графе типа `lrx(N)`/малой головоломке; проверить по гайду upstream: «reliably finds the paths» в beam search — **`lrx-14`, `RESMLP [512,512,512]`, `n_outputs=3`** (631k параметров), 200 эпох × 1024 classic-волка длины 92 + 2% BfsAnchors (depth 6), EMA 0.999, seed 42 — 167 с на CPU, лосс 902 → 248. Критерий upstream проверен на **50 равномерно случайных перестановках** (`torch.randperm`, seed 11) при луче 1000: **50/50 решено**, средняя длина пути 61.2, макс 86 (диаметр графа 91); хэмминг на тех же 50 состояниях — **0/50**. При луче 100 — 17/20. ➕ **скоуп: понадобилась merge-база `base/demo-checkpoint`** (мерж PR10 + PR3 + PR2): Q-модель невозможно ни построить (многовыходная архитектура — PR3), ни применить в луче (`use_child_scores` — PR2) ни в одной ветке по отдельности. ⚠️ **`lrx-20` намеренно НЕ выбран**: тот же рецепт с бюджетом ×4 (400 эпох × 2048 волков, 1463 с) даёт лишь 8/10 при луче 3000–10000, причём лосс встаёт на плато к 5-й эпохе — предел разметки (индекс шага classic-волка), а не бюджета; это ровно задача PR16 (Bellman) и `PathDataSource`. Цифры и диагноз — в заметках
+- [x] выгрузить веса на **свой** Kaggle-аккаунт; добавить запись в `PREDICTOR_MODELS` — [rokham/lrx-14-q](https://www.kaggle.com/models/rokham/lrx-14-q) (`pyTorch/resmlp-512x3`, MIT, публичная; `kagglehub.model_upload` создаёт приватную — публичность выставлена `ApiUpdateModelRequest` + `FieldMask`), файл `lrx_14_q_resmlp.pt` = самоописывающий чекпойнт PR1 (веса + `ModelConfig` + `graph_hash`); анонимное скачивание проверено без `KAGGLE_*` и без `~/.kaggle` → CI не нужны креды. Запись `"lrx-14"` в `PREDICTOR_MODELS` с `n_outputs=3` и `graph_hash`; `prepare_graph("lrx-14")` уже работает (новых графов не добавлялось — правило README)
+- [x] сослаться на этот PR из описаний PR3/PR5/PR6 («веса здесь») — закрыть вопрос «мёртвого кода» — описания [#3](https://github.com/stasdiener/cayleypy/pull/3), [#5](https://github.com/stasdiener/cayleypy/pull/5), [#6](https://github.com/stasdiener/cayleypy/pull/6) обновлены ссылкой на #11 с цифрами 50/50 против 0/50; для #5 и #6 формулировка честная: демо — `RESMLP`, поэтому веса **для трансформера** (нужна головоломка с токенайзер-спекой или конверсия весов Влада) и **для `QV`** (прогон с `v_consistency_weight > 0`) остаются в серии, а #11 доказывает работоспособность всего пути «обучение → чекпойнт → реестр → луч по детям»
+- [x] write tests (success): загрузка новой записи в `models_lib_test` (по прецеденту — публичные веса без skipif) — `test_loads_predictor_models` расширен ветвью для моделей с выходом на генератор (проверяется форма `score_children`), реальные веса с Kaggle, без skipif; плюс slow-тест `test_lrx_14_model_finds_paths` (10 случайных состояний, луч 1000: путь найден, воспроизведён `apply_path` до центрального состояния, длина ≤ диаметра); плюс в `models_test.py` — `ModelConfig.load` из обоих форматов весов даёт идентичные предсказания
+- [x] write tests (error/edge): понятная ошибка при недоступности kagglehub (обёртка, если её нет) — ➕ обёртка добавлена (`RuntimeError` с именем модели и подсказкой про сеть/креды; типы ошибок перечислены списком, т.к. `broad-exception-caught` в этом репо не отключён), тест через monkeypatch `kagglehub.model_download`; плюс `Predictor.pretrained` без модели для графа и ➕ **сверка `graph_hash`**: модели ищутся по имени графа, а Q-модели достаточно переставленных генераторов, чтобы её выходы стали бессмысленными
+- [x] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task — lint зелёный (black 70 файлов, pylint 10.00/10, mypy 70 файлов), `black --check .` по всему репо зелёный (72 файла), `docs/build_docs.sh` (`-W`) зелёный, доктесты `cayleypy/models` и `cayleypy/train` зелёные; `RUN_SLOW_TESTS=1 pytest` = **426 passed / 12 skipped / 3 xfailed** и на 3.12 (torch 2.13), и на 3.9 (`.venv39`, torch 2.8)
+- [x] открыть PR — [stasdiener/cayleypy#11](https://github.com/stasdiener/cayleypy/pull/11), Draft, base `base/demo-checkpoint`, в upstream не отправлялось
 
 ### Task 13: PR12 — SymmetryGroup + TTA
 
@@ -398,7 +401,8 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 | PR8 | `feat/train-losses` | open в форке — [#8](https://github.com/stasdiener/cayleypy/pull/8) (base = `main` форка; независим от PR1) |
 | PR9 | `feat/trainer-core` | draft в форке — [#9](https://github.com/stasdiener/cayleypy/pull/9) (base = `base/trainer-core` = мерж `feat/train-losses` + `feat/score-children-contract`; Draft до мержа PR8 и PR1) |
 | PR10 | `feat/train-data-sources` | draft в форке — [#10](https://github.com/stasdiener/cayleypy/pull/10) (base = `feat/trainer-core`; Draft до мержа PR9) |
-| PR11 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
+| PR11 | `feat/demo-checkpoint` | draft в форке — [#11](https://github.com/stasdiener/cayleypy/pull/11) (base = `base/demo-checkpoint` = мерж `feat/train-data-sources` + `feat/resmlp-qmlp` + `feat/child-scored-beam`; Draft до мержа PR10, PR3 и PR2) |
+| PR12 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
 
 **Фаза публикации в upstream (после ручной проверки пользователем; порядок и сроки — его решение):**
 - открыть design-issue в upstream: роадмап, ссылки на #151/#188, вопрос о судьбе #157/#175/#177/#170
@@ -423,5 +427,6 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 - список `LowerBound`-ов c max-комбинацией — когда появится вторая реализация (PDB)
 
 **Ручная верификация:**
+- ➕ после PR16 повторить рецепт демо-чекпойнта на `lrx-18`/`lrx-20` (сейчас 19/20 и 8/10 при луче 1000–10000 — предел sparse-Q-разметки, см. `docs/plans/notes/20260804-task12-demo-checkpoint.md`); если Bellman-дообучение даёт 50/50, зарегистрировать вторую запись и обновить README
 - паритет Q-трансформера с оригинальными весами Влада (скрипт из Task 6)
 - бенчмарк канон-дедупа и nbt на мегаминксе, луч 2^16, GPU — сравнение средней длины с бейзлайном
