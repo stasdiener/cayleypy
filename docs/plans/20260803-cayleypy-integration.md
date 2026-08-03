@@ -208,13 +208,15 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 **Files:**
 - Create: `cayleypy/models/qv_model.py`, `cayleypy/models/qv_model_test.py`
 - Modify: `cayleypy/models/models.py` (регистрация), `cayleypy/models/__init__.py`, `docs/api.rst`
+- Modify: `cayleypy/predictor.py` (делегирование `score_children` модели), `cayleypy/models/models_test.py` (новые поля конфига) ➕
 
-- [ ] ветка `feat/az-heads` от PR3; `QVModel`: бэкбон из фабрики + q-head (`n_gen`) + v-head (1)
-- [ ] v-consistency **внутри `QVModel.score_children`** (inference-time rescoring, не расширение API `Predictor`): штраф `weight * |Q_child − (V_parent − 1)|`
-- [ ] write tests (success): формы голов; на ручном примере штраф понижает ранг ребёнка, чей Q противоречит V−1; чекпойнт с вложенным конфигом бэкбона
-- [ ] write tests (error/edge): weight<0; бэкбон-конфиг неизвестного типа
-- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
-- [ ] открыть PR
+- [x] ветка `feat/az-heads` от PR3; `QVModel`: бэкбон из фабрики + q-head (`n_gen`) + v-head (1) — `model_type="QV"`; обе головы считает **выходной слой бэкбона** (первые `n_outputs` значений = Q, последнее = V): это математически то же, что две отдельные линейные головы над фичами бэкбона, но без лишнего `Linear(w, w)` без нелинейности, который получился бы при «бэкбон как экстрактор фич + 2 головы»; `forward` возвращает Q (согласовано с конвенцией PR3 «`n_outputs` описывает форму `forward`»), V доступна через `v()`, обе — через `heads()`
+- [x] ➕ **скоуп: бэкбон описан плоским полем `backbone_type: Optional[str]`, а не вложенным конфигом** (в чекбоксе тестов ниже был «вложенный конфиг бэкбона»): по решению #3 плана поля конфига плоские и аддитивные, а остальные поля конфига и так описывают бэкбон — так нет дублирования `input_size`/`num_classes_for_one_hot`, нет фиктивного `layers_sizes` у внешнего конфига и не нужно руками писать `n_gen+1`; чекпойнт по-прежнему полностью описывает модель. Второе новое поле — `v_consistency_weight: float = 0.0`. Бэкбон строится `replace(config, model_type=backbone_type, n_outputs=n_outputs+1).build_model()`, т.е. годится любая зарегистрированная архитектура (MLP/RESMLP сейчас, TRANSFORMER из PR5 после мержа)
+- [x] v-consistency **внутри `QVModel.score_children`** (inference-time rescoring, не расширение API `Predictor`): штраф `weight * |Q_child − (V_parent − 1)|` — при `weight=0` (дефолт) скоры = Q как есть; ➕ **чтобы штраф доезжал до луча**, `Predictor.score_children` теперь делегирует модели, у которой есть свой `score_children` (проверка `getattr`, годится любая такая модель), с тем же батчингом, что и обычные предсказания (батчинг вынесен в `Predictor._apply_batched`, `predict_batched` = обёртка над ним); API `Predictor` не расширялся
+- [x] write tests (success): формы голов; на ручном примере штраф понижает ранг ребёнка, чей Q противоречит V−1; чекпойнт с вложенным конфигом бэкбона — 17 тестов в `qv_model_test.py`: формы Q/V (батч и одиночное состояние, бэкбоны MLP и RESMLP), `forward == q`, `n_outputs` модели и `n_outputs+1` бэкбона, штраф на ручном примере (Q=[3,2], V=4 ⇒ argmin меняется с 1 на 0) и его пропорциональность весу, штраф выключен по умолчанию, round-trip чекпойнта (**конфиг с `backbone_type`/`v_consistency_weight`/`graph_hash` вместо вложенного конфига — см. пункт про скоуп**; скоры после загрузки идентичны), все веса под `backbone.*`, `Predictor` применяет `score_children` модели и батчит его; плюс 2 новых ассерта в `models_test.py` (новые поля в `from_dict`, дефолты для legacy-словаря)
+- [x] write tests (error/edge): weight<0; бэкбон-конфиг неизвестного типа — плюс `backbone_type` не задан, `backbone_type="QV"` (сам себе бэкбон → рекурсия), `n_outputs <= 0`, `n_outputs` не совпадает с числом генераторов графа
+- [x] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task — lint зелёный (black 64, pylint 10.00/10, mypy 64 файла), `black --check .` по всему репо зелёный, `docs/build_docs.sh` (`-W`) зелёный, докстринг-пример проходит `pytest --doctest-modules`; `RUN_SLOW_TESTS=1 pytest` = **352 passed / 12 skipped / 3 xfailed** и на 3.12 (torch 2.13), и на 3.9 (`.venv39`, torch 2.8)
+- [x] открыть PR — [stasdiener/cayleypy#6](https://github.com/stasdiener/cayleypy/pull/6), Draft, base `feat/resmlp-qmlp`, в upstream не отправлялось
 
 ### Task 8: PR7 — EnsemblePredictor (плоский)
 
@@ -389,7 +391,8 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 | PR3 | `feat/resmlp-qmlp` | draft в форке — [#3](https://github.com/stasdiener/cayleypy/pull/3) (base = `feat/score-children-contract`; Draft до мержа PR1) |
 | PR4 | `feat/group-tokenizer` | draft в форке — [#4](https://github.com/stasdiener/cayleypy/pull/4) (base = `feat/score-children-contract`; Draft до мержа PR1) |
 | PR5 | `feat/q-transformer` | draft в форке — [#5](https://github.com/stasdiener/cayleypy/pull/5) (base = `feat/group-tokenizer`; Draft до мержа PR4) |
-| PR6 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
+| PR6 | `feat/az-heads` | draft в форке — [#6](https://github.com/stasdiener/cayleypy/pull/6) (base = `feat/resmlp-qmlp`; Draft до мержа PR3) |
+| PR7 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
 
 **Фаза публикации в upstream (после ручной проверки пользователем; порядок и сроки — его решение):**
 - открыть design-issue в upstream: роадмап, ссылки на #151/#188, вопрос о судьбе #157/#175/#177/#170
