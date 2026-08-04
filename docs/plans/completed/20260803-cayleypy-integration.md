@@ -377,11 +377,13 @@ PR12 (SymmetryGroup+TTA) ── зависит только от PR1
 - Modify: `README.md` форка (сниппет «конфиг → обучение → чекпойнт → ансамбль → beam»)
 - Modify: `CLAUDE.md` этого репо (создать, если нет — паттерны работы с upstream-PR)
 - Move: этот план → `docs/plans/completed/`
+- Create: `docs/plans/notes/20260804-task19-readme-snippet.md` (аудит api.rst + провенанс цифр под сниппетом) ➕
 
-- [ ] `docs/api.rst`: все новые публичные символы в autosummary, job `build-docs` зелёный
-- [ ] README-сниппет одним блоком
-- [ ] обновить/создать CLAUDE.md с выработанными паттернами (stacked-PR протокол, 3.9-ловушки)
-- [ ] перенести план в `docs/plans/completed/`
+- [x] `docs/api.rst`: все новые публичные символы в autosummary, job `build-docs` зелёный — **правок не потребовалось**: машинная сверка (импорт каждой записи + обход `dir()` пакетов `cayleypy`, `.models`, `.train`, `.algo`) даёт 52 записи autosummary, все резолвятся, все публичные символы серии документированы; `docs/build_docs.sh` (sphinx `-W`) зелёный. Не документированы ровно два символа — `cayleypy.MatrixGenerator` и `cayleypy.load_dataset`, **оба предсуществующие в upstream** и вне охвата серии → вынесены в Post-Completion как микро-PR фазы публикации. Данные `CUBE_222_ROTATIONS` (PR12) не экспортируются по конвенции `puzzles/moves.py` (словари ходов там тоже приватны)
+- [x] README-сниппет одним блоком — существующий пример обучения `lrx-14` расширен в **один блок** на весь пайплайн серии: конфиг Q-модели → обучение (волки + 2% anchors) → самоописывающий чекпойнт → Bellman-дообучение `BellmanTrainer.from_checkpoint` → ансамбль двух чекпойнтов → `beam_search(use_child_scores=True, non_backtracking=True)`. Проверен в два прохода: полный бюджет (претрейн 902 → **248.23** — рецепт PR11 воспроизводится бит-в-бит, дообучение 5.95 → 1.57, луч находит путь длины 44) и **дословный ре-прогон вырезанного из README текста** с урезанным бюджетом (exit 0). Цифры под сниппетом измерены на 50 равномерно случайных перестановках: луч 100 — ансамбль 50/50 (средняя длина 63.4), дообученный 49/50, обученный на волках 47/50; луч 300 — все три 50/50 (таблица по лучам 30/100/300 в заметке). Луч в сниппете — 100, а не 1000: при 1000 все три предиктора решают всё и цифры рядом были бы бессодержательны
+- [x] обновить/создать CLAUDE.md с выработанными паттернами (stacked-PR протокол, 3.9-ловушки) — создан на **ветке `plan`** (ветки `feat/*` растут от `main` форка, поэтому любой файл в них попал бы в диф будущего upstream-PR): карта ветвей (`main`/`plan`/`feat/*`/`base/*`/`integration`), протокол стека PR и список «реестровых» конфликтов, правила upstream (2 апрува, сброс апрува пушем, `format-check` по всему репозиторию, а не только `./cayleypy`), локальные команды (`.venv` 3.12/torch 2.13 и `.venv39` 3.9/torch 2.8, доктесты не в CI), ловушки 3.9/torch 2.8, и раздел «факты о коде, стоившие времени» (generator-major `get_neighbors`, identity-хэшер в `get_unique_states`, плоские поля `ModelConfig`, опции луча только в `search_simple`, неизменность state_dict `MlpModel`, баг пустого фронтира, V-голова `QVModel` без супервизии)
+- [x] перенести план в `docs/plans/completed/` — `git mv` вместе с заметками, оставшимися в `docs/plans/notes/`
+- [x] прогон валидации на `integration/all-features` (изменения документационные, код не менялся) — `./lint.sh` зелёный (black 85 файлов, pylint 10.00/10, mypy 85 файлов), `black --check .` по всему репо (89 файлов) зелёный, `docs/build_docs.sh` (`-W`) зелёный, `RUN_SLOW_TESTS=1 pytest` = **596 passed / 12 skipped / 3 xfailed** (как в Task 18); 3.9-прогон не повторялся — питоновский код не изменился ➕
 
 ## Post-Completion
 
@@ -407,7 +409,7 @@ PR12 (SymmetryGroup+TTA) ── зависит только от PR1
 | PR14 | `feat/nbt-simple-beam` | draft в форке — [#14](https://github.com/stasdiener/cayleypy/pull/14) (base = `feat/canonical-dedup`; Draft до мержа PR13) |
 | PR15 | `feat/lower-bound-pruning` | draft в форке — [#15](https://github.com/stasdiener/cayleypy/pull/15) (base = `feat/nbt-simple-beam`; Draft до мержа PR14) |
 | PR16 | `feat/bellman-finetune` | draft в форке — [#16](https://github.com/stasdiener/cayleypy/pull/16) (base = `feat/train-data-sources`; Draft до мержа PR10) |
-| — | `integration/all-features` | запушена в форк, PR не открывался (верификационная ветка Task 18: мерж всех 16 + `cayleypy/integration_test.py`, который в PR не подаётся) |
+| — | `integration/all-features` | запушена в форк, PR не открывался (верификационная ветка Task 18: мерж всех 16 + `cayleypy/integration_test.py`, который в PR не подаётся; плюс сквозной сниппет README из Task 19) |
 
 **Замечания самопроверки (сведено в Task 18):**
 
@@ -420,6 +422,10 @@ PR12 (SymmetryGroup+TTA) ── зависит только от PR1
 *Закрыто по ходу (полные формулировки — в самих задачах, помечены ➕):* публичный `build_model` вместо `_build_model` (PR1); guard на 2-D выход + `predict_batched` как точка входа многовыходных моделей (PR1); новые опции луча — только в `search_simple`, в "advanced" понятная ошибка (PR2/PR13/PR14/PR15); плоское `backbone_type` вместо вложенного конфига бэкбона (PR6); `mask`/`weights` — параметры лоссов, а не третий класс (PR8); `TrainingData` как контракт «данные ↔ тренер» и снятие ограничения «только `n_outputs == 1`» (PR10); `bfs_bitmask` не годится для `BfsLowerBound` — только `BfsResult` (PR15); merge-базы `base/trainer-core`, `base/demo-checkpoint`, `base/canonical-dedup` (иначе диф PR показывал бы чужие ветки); флак от сида в тесте PR13 починен коммитом в его же ветку (найдено в Task 15).
 
 *Для фазы публикации:* конфликты между PR серии — исключительно «реестровые» (`cayleypy/__init__.py`, `cayleypy/models/__init__.py`, `docs/api.rst`, поля/`from_dict`/`build_model` в `models.py`) и решаются объединением строк; подача в порядке графа зависимостей снимает их полностью (проверено сборкой `integration/all-features`).
+
+*Кандидат в отдельный микро-PR (найдено аудитом Task 19):* в `docs/api.rst` upstream отсутствуют два предсуществующих публичных символа — `cayleypy.MatrixGenerator` и `cayleypy.load_dataset` (правка на 2 строки, к серии отношения не имеет — поэтому в верификационную ветку не мешалась).
+
+*Сквозной сниппет README* (Task 19, ветка `integration/all-features`) в upstream подаётся **последним** — он использует тренер, Bellman, чекпойнт, ансамбль и опции луча одновременно, т.е. осмыслен только после мержа PR1/PR3/PR7/PR9/PR10/PR16; до тех пор в upstream-PR идёт та его часть, что относится к уже поданной функциональности.
 
 **Фаза публикации в upstream (после ручной проверки пользователем; порядок и сроки — его решение):**
 - открыть design-issue в upstream: роадмап, ссылки на #151/#188, вопрос о судьбе #157/#175/#177/#170
