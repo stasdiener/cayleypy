@@ -44,7 +44,7 @@
   - **защита от случайного upstream-PR**: в клоне выполнить `gh repo set-default stasdiener/cayleypy` (иначе `gh pr create` на форке по умолчанию целится в upstream); в веб-интерфейсе при создании PR проверять base-репозиторий
   - мержи внутри форка делает пользователь (или по его решению — после самопроверки/агент-ревью); стекать base-ветками можно свободно — всё своё
   - PR держать маленькими и в конвенциях upstream (линт, 3.9, тесты) — они без переделки станут upstream-PR на фазе публикации
-- PR, трогающие `beam_search.py` (PR2 → PR13 → PR14), — **строго последовательно** (текстовые конфликты между собой), каждый следующий от ветки предыдущего; за открытыми upstream-PR #157/#175/#177/#170 следить read-only (осведомлённость о будущих конфликтах)
+- PR, трогающие `beam_search.py` (PR2 → PR13 → PR14 → PR15), — **строго последовательно** (текстовые конфликты между собой), каждый следующий от ветки предыдущего; за открытыми upstream-PR #157/#175/#177/#170 следить read-only (осведомлённость о будущих конфликтах)
 - один Task = один PR; завершать полностью перед началом зависимого
 - **CRITICAL: every task MUST include new/updated tests** (success + error отдельными пунктами)
 - **CRITICAL: all tests must pass before starting next task** (`./lint.sh && RUN_SLOW_TESTS=1 pytest` из корня)
@@ -73,15 +73,14 @@
 
 ```
 PR1 (контракт+конфиг+чекпойнт)
- ├─ PR2 (child-scored beam step)        ── PR13 (канон-дедуп в луче) ── PR14 (nbt для search_simple)
- ├─ PR3 (ResMLP/Q-MLP) ── PR6 (QV/AZ)   [PR2→13→14 строго последовательно: один файл]
+ ├─ PR2 (child-scored beam step)        ── PR13 (канон-дедуп) ── PR14 (nbt) ── PR15 (LowerBound)
+ ├─ PR3 (ResMLP/Q-MLP) ── PR6 (QV/AZ)   [PR2→13→14→15 строго последовательно: один файл]
  ├─ PR4 (токенизатор) ── PR5 (Q-трансформер)
  ├─ PR7 (ансамбли, плоские)
  └─ PR9 (тренер-ядро) ── PR10 (anchors+sparse-Q+beam-пути) ── PR11 (демо-чекпойнт в PREDICTOR_MODELS)
                           └─ PR16 (Bellman-дообучение; использует score_children из PR1)
 PR8 (лоссы) ── независим, можно параллельно с PR1
 PR12 (SymmetryGroup+TTA) ── зависит только от PR1
-PR15 (LowerBound) ── зависит от PR2 (или самостоятельно от main, если PR2 застрял)
 ```
 
 **Ключевые решения:**
@@ -337,13 +336,13 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 - Modify: `cayleypy/algo/beam_search.py`, `cayleypy/algo/beam_search_test.py`
 - Modify: `cayleypy/__init__.py`, `docs/api.rst`
 
-- [ ] ветка `feat/lower-bound-pruning` (от PR2, либо от `main` если PR2 застрял — логика не зависит от child-scoring); протокол `LowerBound.lb(states)` (докстринг: требование допустимости)
-- [ ] `BfsLowerBound` поверх `BfsResult`/`bfs_bitmask`: в таблице → точно, вне → `depth+1`
-- [ ] опции `lower_bound: Optional[LowerBound]`, `prune_above: Optional[int]` (семантика в докстринге: известная верхняя оценка длины; None = выкл), прокинуть через `search()`
-- [ ] write tests (success): на графе с полным BFS фильтр не отсекает состояния оптимального пути (допустимость); max-эффект при заниженном prune_above
-- [ ] write tests (error/edge): `lower_bound=None` — ноль оверхеда/старое поведение; prune_above < длины решения → честный fail поиска
-- [ ] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task
-- [ ] открыть PR
+- [x] ветка `feat/lower-bound-pruning` (от PR2, либо от `main` если PR2 застрял — логика не зависит от child-scoring); протокол `LowerBound.lb(states)` (докстринг: требование допустимости) — ➕ **скоуп: ветка от PR14 (`feat/nbt-simple-beam`), а не от PR2**: PR15 тоже правит `beam_search.py`, а по Development Approach такие PR стекаются строго последовательно (PR2 → PR13 → PR14 → PR15), иначе текстовые конфликты между собственными ветками. `LowerBound` — `typing.Protocol` (`@runtime_checkable`), чтобы годился любой объект с методом `lb`, без наследования; в докстринге зафиксировано требование допустимости (`lb ≤ истина`) и последствие его нарушения (поиск теряет пути)
+- [x] `BfsLowerBound` поверх `BfsResult`/`bfs_bitmask`: в таблице → точно, вне → `depth+1` — ➕ **`bfs_bitmask` не подошёл и в охват не вошёл**: он возвращает только функцию роста (`list[int]`), сопоставить состояние с дистанцией по нему нельзя (проверено по `algo/bfs_bitmask.py`). `BfsLowerBound` — поверх `BfsResult`: все слои хэшей склеиваются в одну сортированную таблицу (`searchsorted`, один int64 на состояние шара), в таблице → точная дистанция, вне → `radius+1`. Валидация: генераторы inverse-closed (иначе BFS от центра меряет дистанцию в другую сторону), `bfs_result.graph == graph.definition`, хэши всех слоёв на месте (`return_all_hashes=True`) и `layers_hashes[0]` — ровно хэш центрального состояния (одной проверкой ловятся и BFS не от центра, и BFS другим объектом `CayleyGraph`, у которого другой сид хэшера)
+- [x] опции `lower_bound: Optional[LowerBound]`, `prune_above: Optional[int]` (семантика в докстринге: известная верхняя оценка длины; None = выкл), прокинуть через `search()` — только `search_simple` (как `use_child_scores`/`canonical_dedup`/`non_backtracking`; в "advanced" — понятная ошибка). Состояние, достигнутое за `k` шагов, выкидывается при `k + lb > prune_above`; отсечение идёт **после** проверки «центральное состояние достигнуто» (найденный путь не теряется) и **после** канон-дедупа (меньше вызовов `lb`), но **до** скоринга и top-k — в этом и смысл: освободить слоты луча. Пустой слой после отсечения = честный «пути такой длины нет». ➕ **скоуп: опции обязательны только вместе** (порознь каждая — молчаливый no-op, поэтому понятная ошибка), `prune_above < 0` отвергается, а «путь длиннее бюджета всё же может быть возвращён» задокументировано (проверка достижения центра идёт раньше отсечения, плюс MITM); ➕ рефакторинг: фильтрация слоя вместе с провенансом (`moves`/`source_index`) вынесена в общий `_filter_layer` (используют канон-дедуп и отсечение)
+- [x] write tests (success): на графе с полным BFS фильтр не отсекает состояния оптимального пути (допустимость); max-эффект при заниженном prune_above — 25 новых тестов. Допустимость: в `lower_bound_test.py` — точность при полном BFS, точность внутри шара и `radius+1` снаружи на **всех** состояниях `lrx(6)`, головоломка с цветами (куб 2×2×2), одиночное состояние vs батч, slow-тест против точных дистанций куба 2×2×2. В луче: при **точной** нижней оценке и `prune_above` = истинной дистанции в луче остаются только состояния на оптимальных путях, поэтому beam находит **оптимальный** путь из всех 119 нецентральных состояний `lrx(5)` даже при `beam_width=1` (плоский поиск решает 10) — это и есть «оптимальный путь не отсекается». Max-эффект: slow-тест «чем больше шар, тем сильнее отсечение» на `lrx(6)` при `beam_width=3` (радиус 0/3/9 → 22/130/703 решённых, все найденные пути оптимальны); плюс отсутствие эффекта при `prune_above=1000` (путь и `debug_scores` совпадают с обычным поиском) и комбинации с child-scoring + канон-дедупом + nbt (паритет Q-модели и скалярного эквивалента — ловит рассинхрон провенанса) и с MITM
+- [x] write tests (error/edge): `lower_bound=None` — ноль оверхеда/старое поведение; prune_above < длины решения → честный fail поиска — дефолты дают ровно старый луч (путь и `debug_scores`); **все** бюджеты от 0 до истинной дистанции−1 на `lrx(6)` дают `path_found=False`, причём поиск обрывается ровно тогда, когда бюджета уже не хватает (`len(debug_scores) <= prune_above`); отдельный тест «найденный путь не отвергается за превышение бюджета»; плюс одна опция без другой, `prune_above < 0`, `lb` неверной формы, обе опции в режиме "advanced", а в `lower_bound_test.py` — BFS без `return_all_hashes`, BFS другого графа, BFS не от центрального состояния, BFS другим объектом графа (другое хэширование), не inverse-closed генераторы
+- [x] run `./lint.sh && RUN_SLOW_TESTS=1 pytest` — must pass before next task — lint зелёный (black 66 файлов, pylint 10.00/10, mypy 66 файлов), `black --check .` по всему репо зелёный (68 файлов), `docs/build_docs.sh` (`-W`) зелёный (страницы `cayleypy.LowerBound` и `cayleypy.BfsLowerBound` генерируются), доктест `lower_bound.py` зелёный; `RUN_SLOW_TESTS=1 pytest` = **413 passed / 12 skipped / 3 xfailed** и на 3.12 (torch 2.13), и на 3.9 (`.venv39`, torch 2.8)
+- [x] открыть PR — [stasdiener/cayleypy#15](https://github.com/stasdiener/cayleypy/pull/15), Draft, base `feat/nbt-simple-beam`, в upstream не отправлялось
 
 ### Task 17: PR16 — Bellman/DAVI-дообучение
 
@@ -404,7 +403,9 @@ PR15 (LowerBound) ── зависит от PR2 (или самостоятел�
 | PR11 | `feat/demo-checkpoint` | draft в форке — [#11](https://github.com/stasdiener/cayleypy/pull/11) (base = `base/demo-checkpoint` = мерж `feat/train-data-sources` + `feat/resmlp-qmlp` + `feat/child-scored-beam`; Draft до мержа PR10, PR3 и PR2) |
 | PR12 | `feat/symmetry-group` | draft в форке — [#12](https://github.com/stasdiener/cayleypy/pull/12) (base = `feat/score-children-contract`; Draft до мержа PR1) |
 | PR13 | `feat/canonical-dedup` | draft в форке — [#13](https://github.com/stasdiener/cayleypy/pull/13) (base = `base/canonical-dedup` = мерж `feat/child-scored-beam` + `feat/symmetry-group`; Draft до мержа PR2 и PR12) |
-| PR14 … PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
+| PR14 | `feat/nbt-simple-beam` | draft в форке — [#14](https://github.com/stasdiener/cayleypy/pull/14) (base = `feat/canonical-dedup`; Draft до мержа PR13) |
+| PR15 | `feat/lower-bound-pruning` | draft в форке — [#15](https://github.com/stasdiener/cayleypy/pull/15) (base = `feat/nbt-simple-beam`; Draft до мержа PR14) |
+| PR16 | … | not started / draft / open / approved(1/2) / merged / blocked |
 
 **Фаза публикации в upstream (после ручной проверки пользователем; порядок и сроки — его решение):**
 - открыть design-issue в upstream: роадмап, ссылки на #151/#188, вопрос о судьбе #157/#175/#177/#170
