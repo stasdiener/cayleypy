@@ -32,12 +32,14 @@ def test_from_dict_legacy():
     assert config.weights_kaggle_id == "fedimser/lrx-16/pyTorch/ep60/1"
     assert config.weights_path == "model_ep60.pth"
 
-    # Defaults describe single-output model without tokenization, not tied to any graph, without a backbone.
+    # Defaults describe single-output model without tokenization, attention or a backbone, not tied to any graph.
     assert config.n_outputs == 1
     assert config.tokenizer_groups is None
     assert config.graph_hash is None
     assert config.backbone_type is None
     assert config.v_consistency_weight == 0.0
+    assert config.n_heads is None
+    assert config.dim_feedforward is None
 
 
 def test_from_dict_new_fields():
@@ -52,6 +54,8 @@ def test_from_dict_new_fields():
             "graph_hash": "abc123",
             "backbone_type": "RESMLP",
             "v_consistency_weight": 0.5,
+            "n_heads": 8,
+            "dim_feedforward": 1024,
         }
     )
     assert config.n_outputs == 12
@@ -59,6 +63,8 @@ def test_from_dict_new_fields():
     assert config.graph_hash == "abc123"
     assert config.backbone_type == "RESMLP"
     assert config.v_consistency_weight == 0.5
+    assert config.n_heads == 8
+    assert config.dim_feedforward == 1024
 
 
 def test_to_dict_round_trip():
@@ -70,6 +76,8 @@ def test_to_dict_round_trip():
         n_outputs=12,
         tokenizer_groups=[[3, 20], [2, 30]],
         graph_hash="abc123",
+        n_heads=8,
+        dim_feedforward=1024,
     )
     as_dict = config.to_dict()
 

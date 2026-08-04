@@ -10,6 +10,7 @@ from kagglehub import exceptions as kagglehub_exceptions
 from torch import nn
 
 from .qv_model import QVModel
+from .transformer import TransformerModel
 
 # Errors kagglehub raises when weights cannot be downloaded: no network, no credentials, no such model. They are
 # wrapped, because on their own they do not say which model of CayleyPy failed to load.
@@ -67,7 +68,7 @@ class ModelConfig:
     tokenization, which is not tied to a particular graph, so configs written before these fields existed keep working.
 
     :param model_type: Type of the model, one of "MLP" (see :class:`MlpModel`), "RESMLP"
-        (see :class:`ResMlpModel`) or "QV" (see :class:`QVModel`).
+        (see :class:`ResMlpModel`), "TRANSFORMER" (see :class:`TransformerModel`) or "QV" (see :class:`QVModel`).
     :param input_size: Number of elements in one state.
     :param num_classes_for_one_hot: Number of distinct values one element of a state can take.
     :param layers_sizes: Sizes of hidden layers (for "RESMLP" these are sizes of residual blocks).
@@ -83,6 +84,9 @@ class ModelConfig:
         All other fields of this config describe that backbone.
     :param v_consistency_weight: Weight of the v-consistency penalty applied by :class:`QVModel` when it scores
         children. 0 means no penalty.
+    :param n_heads: Number of attention heads, for models with attention. None means one head per 64 features.
+    :param dim_feedforward: Width of the feed-forward layer inside a transformer block. None means 4 times the width
+        of the model.
     """
 
     model_type: str
@@ -96,6 +100,8 @@ class ModelConfig:
     graph_hash: Optional[str] = None
     backbone_type: Optional[str] = None
     v_consistency_weight: float = 0.0
+    n_heads: Optional[int] = None
+    dim_feedforward: Optional[int] = None
 
     @staticmethod
     def from_dict(cfg: dict[str, Any]):
@@ -112,6 +118,8 @@ class ModelConfig:
             graph_hash=cfg.get("graph_hash", None),
             backbone_type=cfg.get("backbone_type", None),
             v_consistency_weight=cfg.get("v_consistency_weight", 0.0),
+            n_heads=cfg.get("n_heads", None),
+            dim_feedforward=cfg.get("dim_feedforward", None),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -124,6 +132,8 @@ class ModelConfig:
             return MlpModel(self)
         elif self.model_type == "RESMLP":
             return ResMlpModel(self)
+        elif self.model_type == "TRANSFORMER":
+            return TransformerModel(self)
         elif self.model_type == "QV":
             return QVModel(self)
         else:
