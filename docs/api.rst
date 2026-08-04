@@ -43,6 +43,8 @@ Beam search and ML
     cayleypy.algo.BeamSearchResult
     cayleypy.algo.RandomWalksGenerator
     cayleypy.models.ModelConfig
+    cayleypy.models.MlpModel
+    cayleypy.models.ResMlpModel
     cayleypy.models.graph_hash
     cayleypy.models.save_checkpoint
     cayleypy.models.load_checkpoint
@@ -68,6 +70,9 @@ Training
     cayleypy.train.BfsAnchors
     cayleypy.train.PathDataSource
     cayleypy.train.MixtureDataSource
+    cayleypy.train.bellman_targets
+    cayleypy.train.BellmanTargets
+    cayleypy.train.BellmanTrainer
 
 BFS algorithm and its variations
 ''''''''''''''''''''''''''''''''
