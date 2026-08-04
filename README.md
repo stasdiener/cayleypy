@@ -184,7 +184,9 @@ finding paths in Cayley graph. These models can be easily accessed using `Predic
 ([example](https://www.kaggle.com/code/fedimser/lrx-solution-n-32-beamsearch)).
 
 Each such model is a PyTorch neural network which consists of 3 parts: 
-* Model architecture description (a subclass of `nn.Models`) - defined in `cayleypy/models.py`.
+* Model architecture description (a subclass of `nn.Models`) - defined in `cayleypy/models/`: "MLP" and "RESMLP" in
+  `models.py`, "TRANSFORMER" (which consumes states as tokens, see `GroupTokenizer`) in `transformer.py`, and "QV" (a
+  Q-head and a V-head over any of the others, given by `backbone_type`) in `qv_model.py`.
 * Model architecture hyperparameters (such as input size or sizes of hidden layers) - defined by `models.ModelConfig`.
 * Model weights - these are stored on Kaggle.
 
@@ -194,6 +196,23 @@ Q-model when called with `use_child_scores=True`, see `Predictor.score_children`
 
 List of currently available models is 
 [here](https://github.com/cayleypy/cayleypy/blob/main/cayleypy/models/models_lib.py).
+
+### Beam search options
+
+Beam search has several options that make a predictor go further, all of them available with `beam_mode="simple"`
+(the default) only:
+* `use_child_scores=True` - score all children of the beam in one pass, which is what a Q-model is for (with a
+  single-output model it changes nothing but the order of evaluations).
+* `non_backtracking=True` - never apply the move that undoes the move a state was reached by. Needs generators that are
+  inverse closed.
+* `canonical_dedup=SymmetryGroup(...)` - keep one state per orbit of the symmetries of the graph, which is like
+  multiplying the beam width by the number of symmetries (`SymmetryGroup.reflections` and
+  `SymmetryGroup.rubik_cube_rotations` are ready to use, `SymmetryGroup.derive` finds them for a small graph).
+* `lower_bound=BfsLowerBound(...)` together with `prune_above=k` - drop states that cannot be on a path of length at
+  most `k`, using exact distances of the states near the central state.
+
+Independently of the search, `SymmetrizedPredictor` averages a predictor over symmetries of the graph (test-time
+augmentation), which reduces the error of an imperfect model at the price of one model evaluation per symmetry.
 
 Models can be trained with `cayleypy.train`. The snippet below is the whole way from a model config to a solved state:
 train a Q-model on random walks, save it as a self-describing checkpoint, fine-tune it on Bellman targets, ensemble the
@@ -298,8 +317,8 @@ of them even with beam width 1000.
     * `graph_hash` is hash of the graph your model was trained for (see `models.graph_hash`; a checkpoint written by
         `train.Trainer.save` already stores it). Set it, and loading your model for a graph that has the expected name
         but another definition will fail instead of silently returning nonsense.
-    * If your can be exactly described by one of available model types in `models/models.py`, use that model type
-        with appropriate hyperparameters. If needed, add new hyperparameters to ModelConfig.
+    * If your can be exactly described by one of available model types (see the list of architectures above), use that
+        model type with appropriate hyperparameters. If needed, add new hyperparameters to ModelConfig.
     * If your model architecture is very different from we already have in library, define new model type for it.
     * For example, we already have model type "MLP" (multi-layer perceptron) defined by `MlpModel` with the following
         parameters: `input_size`, `num_classes_for_one_hot`, `layers_sizes`.

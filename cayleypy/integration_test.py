@@ -26,6 +26,18 @@ from .train import BellmanTrainer, TrainConfig, Trainer
 RUN_SLOW_TESTS = os.getenv("RUN_SLOW_TESTS") == "1"
 
 
+class _CountingPredictor(Predictor):
+    """Predictor counting how many times the search asked it to score children."""
+
+    def __init__(self, graph: CayleyGraph, model):
+        super().__init__(graph, model)
+        self.score_children_calls = 0
+
+    def score_children(self, states: torch.Tensor) -> torch.Tensor:
+        self.score_children_calls += 1
+        return super().score_children(states)
+
+
 def _all_states_with_distances(graph: CayleyGraph) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns all states of the graph with their true distances, computed by exact BFS."""
     layers = graph.bfs(max_layer_size_to_store=None).layers
@@ -191,8 +203,9 @@ def test_tokenized_transformer_q_model_composes_with_the_beam():
     """Test that a Q-model with a transformer backbone over a tokenizer can be built, saved and used in the beam.
 
     Weights are random here - this checks that the architectures of the series compose with each other and with beam
-    search, not that they predict anything.
+    search, not that they predict anything. They are seeded, so that the search below is reproducible.
     """
+    torch.manual_seed(0)
     graph = CayleyGraph(PermutationGroups.lrx(5), device="cpu")
     n_generators = graph.definition.n_generators
     # Every element of a state is its own token, which is the trivial (but lossless) tokenization of this graph.
@@ -210,15 +223,19 @@ def test_tokenized_transformer_q_model_composes_with_the_beam():
         v_consistency_weight=0.5,
         graph_hash=graph_hash(graph.definition),
     )
-    predictor = Predictor(graph, config.build_model())
+    predictor = _CountingPredictor(graph, config.build_model())
     scores = predictor.score_children(torch.tensor([[1, 0, 2, 3, 4], [0, 1, 2, 3, 4]]))
     assert scores.shape == (2, n_generators)
 
+    # The state farthest from the central state of this graph (10 moves away), so that the search really runs its loop
+    # instead of finding the goal among the children of the start state.
+    start_state = [1, 0, 4, 3, 2]
+    predictor.score_children_calls = 0
     result = graph.beam_search(
-        start_state=[1, 0, 2, 3, 4],
+        start_state=start_state,
         predictor=predictor,
-        beam_width=10,
-        max_steps=20,
+        beam_width=30,
+        max_steps=40,
         return_path=True,
         use_child_scores=True,
         canonical_dedup=SymmetryGroup.reflections(graph.definition),
@@ -226,4 +243,7 @@ def test_tokenized_transformer_q_model_composes_with_the_beam():
     )
     assert result.path_found
     assert result.path is not None
-    assert graph.apply_path([1, 0, 2, 3, 4], result.path).reshape((-1)).tolist() == graph.central_state.tolist()
+    assert graph.apply_path(start_state, result.path).reshape((-1)).tolist() == graph.central_state.tolist()
+    # The search asked the model for children scores on several of its levels (it only needs them where the layer does
+    # not fit in the beam), so the options above were applied to the model's scores and not bypassed.
+    assert predictor.score_children_calls > 1
