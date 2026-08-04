@@ -438,8 +438,6 @@ class BeamSearchAlgorithm:
                     # No state can be on a path of length at most `prune_above`, so there is no such path.
                     return BeamSearchResult(False, 0, None, debug_scores, graph.definition)
 
-            layer2_moves = expanded.moves if expanded is not None else None
-
             # Pick `beam_width` states with lowest scores.
             if len(layer2) >= beam_width:
                 if expanded is not None and use_child_scores:
@@ -447,11 +445,11 @@ class BeamSearchAlgorithm:
                 else:
                     scores = predictor(graph.decode_states(layer2))
                 idx = torch.argsort(scores)[:beam_width]
-                layer2 = layer2[idx, :]
-                layer2_hashes = layer2_hashes[idx]
-                if layer2_moves is not None:
-                    layer2_moves = layer2_moves[idx]
                 best_score = float(scores[idx[0]].detach())
+                # Provenance is reordered along with the states, so it keeps describing the states next to it.
+                layer2, layer2_hashes = layer2[idx, :], layer2_hashes[idx]
+                if expanded is not None:
+                    expanded = _ExpandedLayer(layer2, layer2_hashes, expanded.moves[idx], expanded.source_index[idx])
                 debug_scores[i] = best_score
                 if graph.verbose >= 2:
                     print(f"Iteration {i}, best score {best_score}.")
@@ -459,8 +457,8 @@ class BeamSearchAlgorithm:
             layer1 = layer2
             layer1_hashes = layer2_hashes
             if non_backtracking:
-                assert inverse_generators is not None and layer2_moves is not None
-                banned_moves = inverse_generators[layer2_moves]
+                assert inverse_generators is not None and expanded is not None
+                banned_moves = inverse_generators[expanded.moves]
             if return_path:
                 all_layers_hashes.append(layer1_hashes)
 
