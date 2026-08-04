@@ -11,6 +11,8 @@ from .predictor import Predictor
 from .puzzles import Puzzles, GapPuzzles
 from .symmetries import SymmetryGroup, SymmetrizedPredictor
 from .train import (
+    BellmanTargets,
+    BellmanTrainer,
     BfsAnchors,
     DataSource,
     Loss,
@@ -24,5 +26,6 @@ from .train import (
     Trainer,
     TrainingData,
     TrainResult,
+    bellman_targets,
     make_loss,
 )
