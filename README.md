@@ -297,8 +297,9 @@ result = graph.beam_search(
 print("Path found:", result.path_found, "length:", result.path_length)
 ```
 
-The snippet trains on random walks with BFS anchors, which is what `TrainConfig` builds by default. Other sources of
-training data can be passed as `Trainer(..., data_source=...)`:
+The snippet trains on random walks with BFS anchors, which is what the `anchors_depth` above asks for - by default it
+is 0 and `TrainConfig` builds random walks alone. Other sources of training data can be passed as
+`Trainer(..., data_source=...)`:
 
 * `PathDataSource` turns paths that are already known into targets for states nothing else reaches - a beam search
   result obtained with `return_path=True`, or the published solutions of a competition
