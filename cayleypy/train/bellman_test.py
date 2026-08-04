@@ -8,6 +8,7 @@ from .config import TrainConfig
 from .data import BfsAnchors, DataSource, MixtureDataSource, RandomWalksSource, TrainingData
 from .trainer import Trainer
 from ..cayley_graph import CayleyGraph
+from ..ensemble import EnsemblePredictor
 from ..graphs_lib import PermutationGroups
 from ..models.models import ModelConfig
 from ..predictor import Predictor
@@ -178,10 +179,19 @@ def test_bellman_targets_accept_a_predictor():
 
 def test_bellman_targets_reject_target_scoring_a_wrong_number_of_children():
     graph = _lrx5()
+    central_state = graph.central_state.reshape(1, -1)
+
     # Two scores per state, while a model estimating distances of children of this graph must return three.
     target = _ConstantModel(1.0, n_outputs=2)
+    with pytest.raises(ValueError, match="2 outputs, but the graph has 3 generators"):
+        bellman_targets(graph, central_state, target)
+
+    # The same, from a model that does not say how many outputs it has - the width of what it returns is still checked.
+    def undeclared_target(states: torch.Tensor) -> torch.Tensor:
+        return torch.ones((states.shape[0], 2))
+
     with pytest.raises(ValueError, match="one score per generator"):
-        bellman_targets(graph, graph.central_state.reshape(1, -1), target)
+        bellman_targets(graph, central_state, undeclared_target)
 
 
 def test_target_given_as_predictor_is_frozen_and_does_not_copy_the_graph():
@@ -500,3 +510,28 @@ def test_bellman_trainer_rejects_graph_without_inverse_closed_generators():
 
     with pytest.raises(ValueError, match="inverse-closed generators"):
         BellmanTrainer(graph, model_config, TrainConfig(n_epochs=1, n_walks=4, rw_length=3))
+
+
+def test_target_can_be_an_ensemble_of_q_models():
+    """Test that a predictor wrapping Q-models can be the target, which is what makes fine-tuning composable."""
+    graph = _lrx5()
+    n_generators = graph.definition.n_generators
+    members = [Predictor(graph, _QModel()), Predictor(graph, _QModel())]
+    ensemble = EnsemblePredictor(members)
+    states = graph.random_walks(width=4, length=3)[0]
+
+    data = bellman_targets(graph, states, ensemble, n_outputs=n_generators)
+
+    assert data.targets.shape == (states.shape[0], n_generators)
+
+    # The ensemble averages the outputs of its members, so its targets are the targets of a model returning that
+    # average. (They are not the average of the members' targets: the Bellman operator takes a minimum, which does not
+    # commute with averaging.)
+    class _AveragedQModel(torch.nn.Module):
+        n_outputs = n_generators
+
+        def forward(self, states: torch.Tensor) -> torch.Tensor:
+            return sum(member.predict_batched(states) for member in members) / len(members)
+
+    expected = bellman_targets(graph, states, Predictor(graph, _AveragedQModel()), n_outputs=n_generators)
+    assert torch.allclose(data.targets, expected.targets)

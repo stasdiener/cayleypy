@@ -51,7 +51,7 @@ def hungarian_rings_permutations(
         right_rotation: permutations for right ring rotation
     Example:
         >>> hungarian_rings_permutations(5, 2, 5, 2)
-        [1, 2, 3, 4, 0, 5, 6, 7], [5, 1, 7, 3, 4, 6, 2, 0]
+        ([1, 2, 3, 4, 0, 5, 6, 7], [5, 1, 7, 3, 4, 6, 2, 0])
     """
     if left_index < 0 or right_index < 0:
         raise ValueError(f"Incorrect index value. left_index:{left_index} right_index:{right_index}")

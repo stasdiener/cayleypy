@@ -214,6 +214,8 @@ Beam search has several options that make a predictor go further, all of them av
 Independently of the search, `SymmetrizedPredictor` averages a predictor over symmetries of the graph (test-time
 augmentation), which reduces the error of an imperfect model at the price of one model evaluation per symmetry.
 
+### Training models
+
 Models can be trained with `cayleypy.train`. The snippet below is the whole way from a model config to a solved state:
 train a Q-model on random walks, save it as a self-describing checkpoint, fine-tune it on Bellman targets, ensemble the
 two checkpoints and search with them. Steps 1-3 are exactly how the "lrx-14" model of this library was trained (about 3
@@ -294,6 +296,19 @@ result = graph.beam_search(
 )
 print("Path found:", result.path_found, "length:", result.path_length)
 ```
+
+The snippet trains on random walks with BFS anchors, which is what `TrainConfig` builds by default. Other sources of
+training data can be passed as `Trainer(..., data_source=...)`:
+
+* `PathDataSource` turns paths that are already known into targets for states nothing else reaches - a beam search
+  result obtained with `return_path=True`, or the published solutions of a competition
+  (`PathDataSource.from_tsv` reads the format of the "cayleypy-beam-results" repository). Its `weight` is what tells the
+  loss that these targets are upper bounds and deserve less trust than exact distances.
+* `MixtureDataSource` combines any sources in given proportions, which is how walks and anchors are mixed above.
+* `BfsAnchors` alone gives exact distances near the central state.
+
+`TrainConfig(loss="pinball", tau=...)` trains a quantile of the target distribution instead of its mean - `tau` below
+0.5 makes the model predict low, i.e. closer to a lower bound on the distance.
 
 On 50 uniformly random permutations of 14 elements with beam width 100, this ensemble finds a path for all 50 of them
 (mean path length 63.4, diameter of the graph is 91), while the fine-tuned checkpoint alone solves 49 and the checkpoint
