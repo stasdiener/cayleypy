@@ -47,9 +47,33 @@ Beam search and ML
     cayleypy.algo.BeamSearchResult
     cayleypy.algo.RandomWalksGenerator
     cayleypy.models.ModelConfig
+    cayleypy.models.MlpModel
+    cayleypy.models.ResMlpModel
     cayleypy.models.graph_hash
     cayleypy.models.save_checkpoint
     cayleypy.models.load_checkpoint
+
+Training
+''''''''
+
+
+.. autosummary::
+    :toctree: generated/
+
+    cayleypy.train.Loss
+    cayleypy.train.MseLoss
+    cayleypy.train.PinballLoss
+    cayleypy.train.make_loss
+    cayleypy.train.TrainConfig
+    cayleypy.train.Trainer
+    cayleypy.train.TrainResult
+    cayleypy.train.TrainingData
+    cayleypy.train.DataSource
+    cayleypy.train.RandomWalksSource
+    cayleypy.train.SparseQSampler
+    cayleypy.train.BfsAnchors
+    cayleypy.train.PathDataSource
+    cayleypy.train.MixtureDataSource
 
 BFS algorithm and its variations
 ''''''''''''''''''''''''''''''''

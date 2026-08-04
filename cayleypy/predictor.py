@@ -4,6 +4,7 @@ from typing import Callable
 
 import torch
 
+from .models.checkpoint import graph_hash
 from .models.models_lib import PREDICTOR_MODELS
 
 if typing.TYPE_CHECKING:
@@ -28,9 +29,15 @@ class Predictor:
             - ``torch.nn.Module`` - will use given neural network model.
             - Any object that has "predict" method (e.g. sklearn models).
             - Any callable object.
+
+            A model estimating distances for all children of a state at once (Q-model) must have as many outputs as
+            there are generators in `graph`, and must declare their number in attribute ``n_outputs`` - then
+            :meth:`score_children` will call it once per state instead of once per child. Models built by
+            :meth:`cayleypy.models.ModelConfig.build_model` declare it automatically.
         """
         self.graph = graph
         self.predict = lambda x: x  # type: Callable[[torch.Tensor], torch.Tensor]
+        self.n_outputs = int(getattr(models_or_heuristics, "n_outputs", 1))
 
         if models_or_heuristics == "zero":
             self.predict = lambda x: torch.zeros((x.shape[0],))
@@ -49,11 +56,25 @@ class Predictor:
 
     @staticmethod
     def pretrained(graph: "CayleyGraph"):
-        """Loads pre-trained predictor for this graph."""
+        """Loads pre-trained predictor for this graph.
+
+        Graphs are looked up by name, so if the config of the pretrained model says which graph the model was trained
+        for (`ModelConfig.graph_hash`), it is checked that it is this graph. Without that check, a graph that has the
+        expected name but another definition would silently get a model that means nothing for it - and for a model
+        having one output per generator, even reordering the generators is enough to make its outputs meaningless.
+
+        :param graph: Graph to load the model for.
+        :return: Predictor using the pretrained model.
+        """
         if graph.definition.name not in PREDICTOR_MODELS:
             raise KeyError("No pretrained model for this graph.")
-        model = PREDICTOR_MODELS[graph.definition.name].load(graph.device)
-        return Predictor(graph, model)
+        config = PREDICTOR_MODELS[graph.definition.name]
+        if config.graph_hash is not None and config.graph_hash != graph_hash(graph.definition):
+            raise ValueError(
+                f'Pretrained model for "{graph.definition.name}" was trained for another graph (hash in the config of '
+                f"the model is {config.graph_hash}, hash of the given graph is {graph_hash(graph.definition)})."
+            )
+        return Predictor(graph, config.load(graph.device))
 
     def predict_batched(self, states: torch.Tensor) -> torch.Tensor:
         """Applies the underlying model to `states`, splitting them into batches if there are too many.
@@ -79,7 +100,7 @@ class Predictor:
         if len(ans.shape) != 1:
             raise ValueError(
                 f"Model returned output of shape {tuple(ans.shape)}, but one score per state (1-D output) was "
-                "expected. Models having one output per generator must implement Predictor.score_children instead."
+                "expected. Models having one output per generator must be used through Predictor.score_children."
             )
         return ans
 
@@ -89,9 +110,11 @@ class Predictor:
         Children are enumerated in the order of generators: element ``[i, j]`` of the answer is the estimated distance
         for the state obtained by applying generator ``j`` to ``states[i]``.
 
-        This default implementation calls the underlying model for every child, so it needs `n_generators` times more
-        model evaluations than :meth:`__call__`. Models having one output per generator (Q-models) are expected to
-        override this method and compute the whole answer in a single forward pass.
+        For a model having one output per generator (Q-model, i.e. ``n_outputs == n_generators``), the answer is the
+        output of the model applied to `states`, so one model evaluation per state is needed.
+
+        Otherwise (for a single-output model), the model is called for every child, which needs `n_generators` times
+        more model evaluations than :meth:`__call__`.
 
         :param states: States (in decoded representation) whose children to score.
         :return: Tensor of shape ``[n_states, n_generators]`` with estimated distances for children.
@@ -99,6 +122,20 @@ class Predictor:
         n_generators = self.graph.definition.n_generators
         encoded_states = self.graph.encode_states(states)
         num_states = int(encoded_states.shape[0])
+        if self.n_outputs != 1:
+            if self.n_outputs != n_generators:
+                raise ValueError(
+                    f"Model has {self.n_outputs} outputs, but the graph has {n_generators} generators. Model used to "
+                    "score children must have either 1 output (for the state it is applied to), or one output per "
+                    "generator (for every child of that state)."
+                )
+            scores = self.predict_batched(self.graph.decode_states(encoded_states))
+            if tuple(scores.shape) != (num_states, n_generators):
+                raise ValueError(
+                    f"Model returned output of shape {tuple(scores.shape)}, but shape "
+                    f"({num_states}, {n_generators}) was expected."
+                )
+            return scores
         children = self.graph.decode_states(self.graph.get_neighbors(encoded_states))
         scores = self(children)
         # `get_neighbors` returns neighbors in generator-major order: rows [i*num_states, (i+1)*num_states) are children
