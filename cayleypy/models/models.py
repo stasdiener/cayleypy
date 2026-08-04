@@ -9,6 +9,8 @@ import torch
 from kagglehub import exceptions as kagglehub_exceptions
 from torch import nn
 
+from .qv_model import QVModel
+
 # Errors kagglehub raises when weights cannot be downloaded: no network, no credentials, no such model. They are
 # wrapped, because on their own they do not say which model of CayleyPy failed to load.
 _KAGGLEHUB_ERRORS = (
@@ -60,12 +62,12 @@ def _load_state_dict(path: str, device: str) -> dict[str, Any]:
 class ModelConfig:
     """Configuration used to describe ML model.
 
-    Fields `n_outputs`, `tokenizer_groups` and `graph_hash` describe capabilities added after the first version of this
-    class. Their defaults describe a single-output model without tokenization, which is not tied to a particular graph,
-    so configs written before these fields existed keep working.
+    Fields `n_outputs`, `tokenizer_groups`, `graph_hash`, `backbone_type` and `v_consistency_weight` describe
+    capabilities added after the first version of this class. Their defaults describe a single-output model without
+    tokenization, which is not tied to a particular graph, so configs written before these fields existed keep working.
 
-    :param model_type: Type of the model, one of "MLP" (see :class:`MlpModel`) or "RESMLP"
-        (see :class:`ResMlpModel`).
+    :param model_type: Type of the model, one of "MLP" (see :class:`MlpModel`), "RESMLP"
+        (see :class:`ResMlpModel`) or "QV" (see :class:`QVModel`).
     :param input_size: Number of elements in one state.
     :param num_classes_for_one_hot: Number of distinct values one element of a state can take.
     :param layers_sizes: Sizes of hidden layers (for "RESMLP" these are sizes of residual blocks).
@@ -77,6 +79,10 @@ class ModelConfig:
         ``[group_size, num_groups]`` pairs. For example, ``[[3, 20], [2, 30]]`` means 20 tokens of 3 elements followed
         by 30 tokens of 2 elements. None means the state is not tokenized.
     :param graph_hash: Hash of the graph this model was trained for, see :func:`cayleypy.models.graph_hash`.
+    :param backbone_type: Type of the backbone for models built on top of another architecture (only "QV" needs it).
+        All other fields of this config describe that backbone.
+    :param v_consistency_weight: Weight of the v-consistency penalty applied by :class:`QVModel` when it scores
+        children. 0 means no penalty.
     """
 
     model_type: str
@@ -88,6 +94,8 @@ class ModelConfig:
     n_outputs: int = 1
     tokenizer_groups: Optional[list[list[int]]] = None
     graph_hash: Optional[str] = None
+    backbone_type: Optional[str] = None
+    v_consistency_weight: float = 0.0
 
     @staticmethod
     def from_dict(cfg: dict[str, Any]):
@@ -102,6 +110,8 @@ class ModelConfig:
             n_outputs=cfg.get("n_outputs", 1),
             tokenizer_groups=cfg.get("tokenizer_groups", None),
             graph_hash=cfg.get("graph_hash", None),
+            backbone_type=cfg.get("backbone_type", None),
+            v_consistency_weight=cfg.get("v_consistency_weight", 0.0),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -114,6 +124,8 @@ class ModelConfig:
             return MlpModel(self)
         elif self.model_type == "RESMLP":
             return ResMlpModel(self)
+        elif self.model_type == "QV":
+            return QVModel(self)
         else:
             raise ValueError("Unknown model type: " + self.model_type)
 
