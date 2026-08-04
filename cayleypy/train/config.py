@@ -31,9 +31,11 @@ class TrainConfig:
     :param rw_length: Length of every random walk. Must be at least 2. Should be at least as large as the diameter of
         the graph, otherwise the model never sees distant states.
     :param rw_mode: Mode of random walk generation - one of "classic", "bfs", "nbt". Defaults to "nbt", which mixes
-        fastest, meaning the number of steps is the closest estimate of the true distance. Ignored when training a
-        Q-model: its data comes from :class:`cayleypy.train.SparseQSampler`, which needs walks to be paths and
-        therefore always uses "classic" walks.
+        fastest, meaning the number of steps is the closest estimate of the true distance. Ignored by
+        :class:`cayleypy.train.Trainer` when training a Q-model: its data comes from
+        :class:`cayleypy.train.SparseQSampler`, which needs walks to be paths and therefore always uses "classic" walks.
+        :class:`cayleypy.train.BellmanTrainer` honors it for Q-models too, because Bellman targets label every output of
+        a state and so do not need walks to be paths.
     :param nbt_history_depth: For "nbt" mode, how many previous levels to remember and ban from revisiting.
     :param anchors_depth: Depth of the breadth-first search producing anchors - states with exact distances that are
         mixed into the data, see :class:`cayleypy.train.BfsAnchors`. 0 (the default) means no anchors. Note that memory
