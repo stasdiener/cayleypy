@@ -83,7 +83,8 @@ class ModelConfig:
     :param backbone_type: Type of the backbone for models built on top of another architecture (only "QV" needs it).
         All other fields of this config describe that backbone.
     :param v_consistency_weight: Weight of the v-consistency penalty applied by :class:`QVModel` when it scores
-        children. 0 means no penalty.
+        children. 0 means no penalty, and it must stay 0 unless the V-head of the model was supervised during training
+        (see :class:`QVModel`).
     :param n_heads: Number of attention heads, for models with attention. None means one head per 64 features.
     :param dim_feedforward: Width of the feed-forward layer inside a transformer block. None means 4 times the width
         of the model.
