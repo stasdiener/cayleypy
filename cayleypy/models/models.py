@@ -63,9 +63,10 @@ def _load_state_dict(path: str, device: str) -> dict[str, Any]:
 class ModelConfig:
     """Configuration used to describe ML model.
 
-    Fields `n_outputs`, `tokenizer_groups`, `graph_hash`, `backbone_type` and `v_consistency_weight` describe
-    capabilities added after the first version of this class. Their defaults describe a single-output model without
-    tokenization, which is not tied to a particular graph, so configs written before these fields existed keep working.
+    Fields `n_outputs`, `tokenizer_groups`, `graph_hash`, `backbone_type`, `v_consistency_weight`, `n_heads` and
+    `dim_feedforward` describe capabilities added after the first version of this class. Their defaults describe a
+    single-output model without tokenization, which is not tied to a particular graph, so configs written before these
+    fields existed keep working.
 
     :param model_type: Type of the model, one of "MLP" (see :class:`MlpModel`), "RESMLP"
         (see :class:`ResMlpModel`), "TRANSFORMER" (see :class:`TransformerModel`) or "QV" (see :class:`QVModel`).
