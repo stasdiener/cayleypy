@@ -80,7 +80,7 @@ Training
     cayleypy.train.MixtureDataSource
     cayleypy.train.bellman_targets
     cayleypy.train.BellmanTargets
-    cayleypy.train.BellmanTrainer
+    cayleypy.train.make_bellman_source
 
 BFS algorithm and its variations
 ''''''''''''''''''''''''''''''''

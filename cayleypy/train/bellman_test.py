@@ -1,9 +1,11 @@
+from dataclasses import replace
+
 import os
 
 import pytest
 import torch
 
-from .bellman import BellmanTargets, BellmanTrainer, _BellmanWithAnchors, bellman_targets
+from .bellman import BellmanTargets, _BellmanWithAnchors, bellman_targets, make_bellman_source
 from .config import TrainConfig
 from .data import BfsAnchors, DataSource, RandomWalksSource, TrainingData
 from .trainer import Trainer
@@ -281,13 +283,12 @@ def test_bellman_targets_source_for_q_model():
 def test_bellman_trainer_mixes_bellman_targets_with_anchors():
     graph = _lrx5()
     config = TrainConfig(n_epochs=1, n_walks=4, rw_length=5, batch_size=8, anchors_fraction=0.5, seed=0)
-    trainer = BellmanTrainer(graph, MLP_CONFIG, config)
+    trainer = Trainer(graph, MLP_CONFIG, replace(config, targets="bellman"))
     source = trainer.data_source
     assert isinstance(source, _BellmanWithAnchors)
     assert isinstance(source.bellman_source, BellmanTargets)
     assert isinstance(source.anchors, BfsAnchors)
     assert source.anchors_fraction == 0.5
-    assert source.bellman_source is trainer.bellman_source
 
 
 class _FixedStatesSource(DataSource):
@@ -307,7 +308,14 @@ def test_bellman_trainer_sizes_anchors_from_a_custom_states_source():
     # The config says 4*3=12 states per epoch, but the source generates 120. Sizing the anchors from the config would
     # leave them able to support only 50 states, and all but 49 of the source's states would be thrown away.
     config = TrainConfig(n_epochs=1, n_walks=4, rw_length=3, anchors_fraction=0.02, seed=0)
-    trainer = BellmanTrainer(graph, MLP_CONFIG, config, states_source=_FixedStatesSource(graph, 120))
+    trainer = Trainer(
+        graph,
+        MLP_CONFIG,
+        config,
+        data_source=make_bellman_source(
+            graph, config, MLP_CONFIG.build_model(), states_source=_FixedStatesSource(graph, 120)
+        ),
+    )
     data = trainer.generate_data()
     # Every state of the source is kept, and 2% of the epoch on top of them are anchors.
     assert len(data) == 122
@@ -317,7 +325,7 @@ def test_bellman_trainer_sizes_anchors_from_a_custom_states_source():
 def test_bellman_trainer_anchors_have_exact_targets():
     graph = _lrx5()
     config = TrainConfig(n_epochs=1, n_walks=8, rw_length=5, anchors_fraction=0.5, bellman_anchors_depth=2, seed=0)
-    trainer = BellmanTrainer(graph, MLP_CONFIG, config, model=_ConstantModel(100.0))
+    trainer = Trainer(graph, MLP_CONFIG, replace(config, targets="bellman"), model=_ConstantModel(100.0))
     data = trainer.generate_data()
     # Walks give 8*5 states, and anchors are sampled to the same number, because they are half of the data.
     assert len(data) == 80
@@ -331,7 +339,7 @@ def test_bellman_trainer_anchors_have_exact_targets():
 def test_bellman_trainer_refreshes_the_target_every_epoch():
     graph = _lrx5()
     config = TrainConfig(n_epochs=3, n_walks=4, rw_length=5, batch_size=8, lr=0.05, ema_decay=0, seed=0)
-    trainer = BellmanTrainer(graph, MLP_CONFIG, config)
+    trainer = Trainer(graph, MLP_CONFIG, replace(config, targets="bellman"))
     states, _ = _all_states_with_distances(graph)
     for _ in range(config.n_epochs):
         with torch.no_grad():
@@ -339,7 +347,7 @@ def test_bellman_trainer_refreshes_the_target_every_epoch():
         trainer.train_epoch()
         with torch.no_grad():
             # The target is the model as it was at the beginning of the epoch.
-            assert torch.equal(trainer.bellman_source.target(states), expected)
+            assert torch.equal(trainer.data_source.bellman_source.target(states), expected)
             assert not torch.equal(trainer.predictor()(states), expected)
 
 
@@ -348,26 +356,26 @@ def test_bellman_trainer_keeps_the_target_for_the_configured_number_of_epochs():
     config = TrainConfig(
         n_epochs=4, n_walks=4, rw_length=5, batch_size=8, lr=0.05, ema_decay=0, bellman_target_update_period=2, seed=0
     )
-    trainer = BellmanTrainer(graph, MLP_CONFIG, config)
+    trainer = Trainer(graph, MLP_CONFIG, replace(config, targets="bellman"))
     states, _ = _all_states_with_distances(graph)
 
     trainer.train_epoch()
     with torch.no_grad():
-        after_first_refresh = trainer.bellman_source.target(states).clone()
+        after_first_refresh = trainer.data_source.bellman_source.target(states).clone()
     trainer.train_epoch()
     with torch.no_grad():
         # Second epoch does not refresh the target, so it is still the same.
-        assert torch.equal(trainer.bellman_source.target(states), after_first_refresh)
+        assert torch.equal(trainer.data_source.bellman_source.target(states), after_first_refresh)
         expected = trainer.predictor()(states).clone()
     trainer.train_epoch()
     with torch.no_grad():
         # Third epoch refreshes it, to the weights the model had when that epoch started.
-        assert torch.equal(trainer.bellman_source.target(states), expected)
+        assert torch.equal(trainer.data_source.bellman_source.target(states), expected)
 
 
 def test_training_on_bellman_targets_reduces_the_loss():
     graph = _lrx5()
-    trainer = BellmanTrainer(graph, MLP_CONFIG, TrainConfig(n_walks=8, rw_length=5, lr=0.01, seed=0))
+    trainer = Trainer(graph, MLP_CONFIG, TrainConfig(n_walks=8, rw_length=5, lr=0.01, seed=0, targets="bellman"))
     data = trainer.generate_data()
     first_loss = trainer.train_step(data.states, data.targets)
     for _ in range(10):
@@ -378,7 +386,7 @@ def test_training_on_bellman_targets_reduces_the_loss():
 def test_bellman_trainer_trains_a_q_model():
     graph = _lrx5()
     config = TrainConfig(n_epochs=2, n_walks=8, rw_length=5, batch_size=16, lr=0.01, seed=0)
-    trainer = BellmanTrainer(graph, Q_CONFIG, config, model=_QModel())
+    trainer = Trainer(graph, Q_CONFIG, replace(config, targets="bellman"), model=_QModel())
     data = trainer.generate_data()
     assert data.targets.shape[1] == 3
     assert data.mask is None
@@ -396,8 +404,9 @@ def test_bellman_trainer_from_checkpoint_continues_from_the_pretrained_model(tmp
     pretrained.save(path)
 
     # Fine-tuning normally uses a lower learning rate than pretraining, because targets move as the model moves.
-    trainer = BellmanTrainer.from_checkpoint(path, graph, TrainConfig(n_epochs=1, n_walks=4, rw_length=3, lr=1e-4))
-    assert isinstance(trainer, BellmanTrainer)
+    trainer = Trainer.from_checkpoint(
+        path, graph, TrainConfig(n_epochs=1, n_walks=4, rw_length=3, lr=1e-4, targets="bellman")
+    )
     states, _ = _all_states_with_distances(graph)
     with torch.no_grad():
         assert torch.equal(trainer.model(states), pretrained.ema_model(states))
@@ -410,7 +419,7 @@ def test_bellman_trainer_does_not_move_the_scale_without_optimization():
     # Sanity check: bootstrapped targets by themselves change nothing - predictions only move when weights do.
     graph = _lrx5()
     config = TrainConfig(n_epochs=5, n_walks=8, rw_length=5, batch_size=16, lr=1e-12, seed=0)
-    trainer = BellmanTrainer(graph, MLP_CONFIG, config)
+    trainer = Trainer(graph, MLP_CONFIG, replace(config, targets="bellman"))
     states, _ = _all_states_with_distances(graph)
     with torch.no_grad():
         before = trainer.predictor()(states).clone()
@@ -454,13 +463,13 @@ def test_bellman_trainer_rejects_checkpoint_for_another_graph(tmp_path):
     Trainer(_lrx5(), MLP_CONFIG, TINY_CONFIG).save(path)
     another_graph = CayleyGraph(PermutationGroups.lrx(5, k=2), device="cpu")
     with pytest.raises(ValueError, match="was trained for another graph"):
-        BellmanTrainer.from_checkpoint(path, another_graph, TINY_CONFIG)
+        Trainer.from_checkpoint(path, another_graph, replace(TINY_CONFIG, targets="bellman"))
 
 
 def test_bellman_trainer_rejects_model_with_wrong_number_of_outputs():
     config = ModelConfig(model_type="MLP", input_size=5, num_classes_for_one_hot=5, layers_sizes=[16], n_outputs=4)
     with pytest.raises(ValueError, match="one output per generator of this graph, of which there are 3"):
-        BellmanTrainer(_lrx5(), config, TINY_CONFIG, model=_QModel(n_outputs=4))
+        Trainer(_lrx5(), config, replace(TINY_CONFIG, targets="bellman"), model=_QModel(n_outputs=4))
 
 
 def _mean_absolute_error(graph: CayleyGraph, predictor: Predictor) -> float:
@@ -490,9 +499,16 @@ def test_bellman_finetuning_improves_a_pretrained_model(tmp_path):
     assert abs(_prediction_at_central_state(graph, pretrained.predictor())) > 1.0
 
     finetune_config = TrainConfig(
-        n_epochs=100, n_walks=64, rw_length=12, batch_size=128, lr=0.001, bellman_anchors_depth=2, seed=42
+        n_epochs=100,
+        n_walks=64,
+        rw_length=12,
+        batch_size=128,
+        lr=0.001,
+        bellman_anchors_depth=2,
+        seed=42,
+        targets="bellman",
     )
-    finetuned = BellmanTrainer.from_checkpoint(path, graph, finetune_config)
+    finetuned = Trainer.from_checkpoint(path, graph, finetune_config)
     finetuned.train()
     error_after = _mean_absolute_error(graph, finetuned.predictor())
     assert error_after < 0.7 * error_before
@@ -506,9 +522,16 @@ def test_bellman_training_from_scratch_learns_exact_distances():
     graph = _lrx5()
     model_config = ModelConfig(model_type="MLP", input_size=5, num_classes_for_one_hot=5, layers_sizes=[64, 64])
     config = TrainConfig(
-        n_epochs=200, n_walks=64, rw_length=12, batch_size=128, lr=0.01, bellman_anchors_depth=2, seed=0
+        n_epochs=200,
+        n_walks=64,
+        rw_length=12,
+        batch_size=128,
+        lr=0.01,
+        bellman_anchors_depth=2,
+        seed=0,
+        targets="bellman",
     )
-    trainer = BellmanTrainer(graph, model_config, config)
+    trainer = Trainer(graph, model_config, config)
     trainer.train()
     # Predicting the mean distance for every state would give an error of 1.47 on this graph.
     assert _mean_absolute_error(graph, trainer.predictor()) < 0.5
@@ -520,9 +543,9 @@ def test_bellman_trainer_honors_the_walk_mode_for_a_q_model():
     graph = _lrx5()
     config = TrainConfig(n_epochs=1, n_walks=4, rw_length=3, batch_size=8, rw_mode="bfs", seed=0)
 
-    trainer = BellmanTrainer(graph, Q_CONFIG, config, model=_QModel())
+    trainer = Trainer(graph, Q_CONFIG, replace(config, targets="bellman"), model=_QModel())
 
-    states_source = trainer.bellman_source.states_source
+    states_source = trainer.data_source.bellman_source.states_source
     assert isinstance(states_source, RandomWalksSource)
     assert states_source.mode == "bfs"
 
@@ -533,7 +556,7 @@ def test_bellman_trainer_rejects_graph_without_inverse_closed_generators():
     model_config = ModelConfig(model_type="MLP", input_size=5, num_classes_for_one_hot=5, layers_sizes=[8])
 
     with pytest.raises(ValueError, match="inverse-closed generators"):
-        BellmanTrainer(graph, model_config, TrainConfig(n_epochs=1, n_walks=4, rw_length=3))
+        Trainer(graph, model_config, TrainConfig(n_epochs=1, n_walks=4, rw_length=3, targets="bellman"))
 
 
 def test_target_can_be_an_ensemble_of_q_models():

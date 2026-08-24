@@ -21,7 +21,7 @@ from . import (
     SymmetryGroup,
 )
 from .models import GroupTokenizer, ModelConfig, graph_hash, load_checkpoint
-from .train import BellmanTrainer, TrainConfig, Trainer
+from .train import TrainConfig, Trainer
 
 RUN_SLOW_TESTS = os.getenv("RUN_SLOW_TESTS") == "1"
 
@@ -127,9 +127,9 @@ def test_end_to_end_trained_q_model_solves_lrx5_optimally(tmp_path):
         anchors_fraction=0.05,
         ema_decay=0.99,
         seed=42,
+        targets="bellman",
     )
-    bellman_trainer = BellmanTrainer.from_checkpoint(pretrain_path, graph, finetune_config)
-    assert isinstance(bellman_trainer, BellmanTrainer)
+    bellman_trainer = Trainer.from_checkpoint(pretrain_path, graph, finetune_config)
     bellman_trainer.train()
     finetune_path = str(tmp_path / "finetune.pt")
     bellman_trainer.save(finetune_path)

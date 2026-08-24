@@ -13,7 +13,7 @@ from .puzzles import Puzzles, GapPuzzles
 from .symmetries import SymmetryGroup, SymmetrizedPredictor
 from .train import (
     BellmanTargets,
-    BellmanTrainer,
+    make_bellman_source,
     BfsAnchors,
     DataSource,
     Loss,

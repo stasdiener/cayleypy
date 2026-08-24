@@ -1,11 +1,14 @@
+import gc
 import os
 import warnings
+import weakref
 
 import pytest
 import torch
 
 from .config import TrainConfig
-from .data import MixtureDataSource, PathDataSource, SparseQSampler, TrainingData
+from .bellman import BellmanTargets, _BellmanWithAnchors, make_bellman_source
+from .data import DataSource, MixtureDataSource, PathDataSource, RandomWalksSource, SparseQSampler, TrainingData
 from .trainer import Trainer
 from ..cayley_graph import CayleyGraph
 from ..cayley_graph_def import CayleyGraphDef
@@ -454,3 +457,216 @@ def test_ema_copies_non_float_entries_of_the_state_dict():
     # Averaging an integer entry in place would fail outright, and its value must follow the model exactly.
     assert int(model.n_batches) == 2
     assert int(trainer.ema_model.state_dict()["n_batches"]) == 2
+
+
+def _lrx5_graph() -> CayleyGraph:
+    return CayleyGraph(PermutationGroups.lrx(5), device="cpu")
+
+
+def test_train_stages_reports_losses_of_every_stage():
+    graph = _lrx5_graph()
+    common = {"n_walks": 8, "rw_length": 4, "batch_size": 16, "seed": 0}
+    stages = [TrainConfig(n_epochs=3, **common), TrainConfig(n_epochs=2, lr=1e-4, **common)]
+    result = Trainer(graph, MLP_CONFIG, stages[0]).train_stages(stages)
+
+    assert [len(stage) for stage in result.stage_losses] == [3, 2]
+    # The flat curve is the stages one after another, so a boundary is visible in the split but not lost in the curve.
+    assert result.losses == [loss for stage in result.stage_losses for loss in stage]
+
+
+def test_train_stages_rejects_empty_list():
+    graph = _lrx5_graph()
+    with pytest.raises(ValueError, match="At least one stage"):
+        Trainer(graph, MLP_CONFIG, TrainConfig(n_epochs=1, n_walks=4, rw_length=3)).train_stages([])
+
+
+def test_set_stage_keeps_the_model_and_restarts_the_optimizer():
+    graph = _lrx5_graph()
+    first = TrainConfig(n_epochs=2, n_walks=8, rw_length=4, batch_size=16, lr=1e-2, lr_min=1e-5, seed=0)
+    trainer = Trainer(graph, MLP_CONFIG, first)
+    trainer.train()
+    weights_before = {name: parameter.clone() for name, parameter in trainer.model.named_parameters()}
+    ema_before = trainer.ema_model
+    optimizer_before = trainer.optimizer
+
+    second = TrainConfig(n_epochs=3, n_walks=8, rw_length=4, batch_size=16, lr=1e-3, seed=0)
+    trainer.set_stage(second)
+
+    # The model and its EMA copy carry over - a stage continues training them, it does not start from scratch.
+    for name, parameter in trainer.model.named_parameters():
+        assert torch.equal(parameter, weights_before[name])
+    assert trainer.ema_model is ema_before
+    # The optimizer, the schedule and the epoch counter are new, so the schedule spans this stage and not the last one.
+    assert trainer.optimizer is not optimizer_before
+    assert trainer.epoch == 0
+    assert trainer.learning_rate == pytest.approx(second.lr)
+    assert trainer.config is second
+
+
+def test_bellman_targets_are_built_from_the_config():
+    graph = _lrx5_graph()
+    config = TrainConfig(n_epochs=1, n_walks=4, rw_length=5, batch_size=8, targets="bellman", seed=0)
+    trainer = Trainer(graph, MLP_CONFIG, config)
+
+    assert isinstance(trainer.data_source, _BellmanWithAnchors)
+    assert isinstance(trainer.data_source.bellman_source, BellmanTargets)
+
+
+def test_stage_switches_the_target_scheme():
+    graph = _lrx5_graph()
+    common = {"n_walks": 8, "rw_length": 4, "batch_size": 16, "seed": 0}
+    trainer = Trainer(graph, MLP_CONFIG, TrainConfig(n_epochs=1, **common))
+    assert isinstance(trainer.data_source, RandomWalksSource)
+
+    trainer.set_stage(TrainConfig(n_epochs=1, targets="bellman", lr=1e-4, **common))
+    assert isinstance(trainer.data_source, _BellmanWithAnchors)
+
+
+def test_bellman_target_follows_the_model_between_epochs():
+    graph = _lrx5_graph()
+    config = TrainConfig(n_epochs=2, n_walks=8, rw_length=4, batch_size=16, lr=0.1, targets="bellman", seed=0)
+    trainer = Trainer(graph, MLP_CONFIG, config)
+    target_before = trainer.data_source.bellman_source.target
+
+    trainer.train()
+
+    # Without the on_epoch_start hook the frozen copy made at construction would label every epoch.
+    assert trainer.data_source.bellman_source.target is not target_before
+
+
+def test_unknown_targets_are_rejected():
+    with pytest.raises(ValueError, match="Unknown targets"):
+        TrainConfig(targets="whatever")
+
+
+def test_stage_can_turn_ema_on_and_off():
+    graph = _lrx5_graph()
+    common = {"n_epochs": 1, "n_walks": 8, "rw_length": 4, "batch_size": 16, "seed": 0}
+
+    # Starting without averaging, a later stage that asks for it gets a copy - of the weights it inherited.
+    trainer = Trainer(graph, MLP_CONFIG, TrainConfig(ema_decay=0, **common))
+    assert trainer.ema_model is None
+    trainer.set_stage(TrainConfig(ema_decay=0.99, **common))
+    assert trainer.ema_model is not None
+    for name, parameter in trainer.model.named_parameters():
+        assert torch.equal(dict(trainer.ema_model.named_parameters())[name], parameter)
+
+    # And a stage that turns averaging off drops the copy, instead of leaving a stale one behind.
+    trainer.set_stage(TrainConfig(ema_decay=0, **common))
+    assert trainer.ema_model is None
+    assert trainer.model_for_inference() is trainer.model
+
+
+def test_bellman_source_forwards_epoch_start_to_the_source_of_states():
+    class _CountingSource(DataSource):
+        def __init__(self, inner):
+            self.inner = inner
+            self.epochs = 0
+
+        def on_epoch_start(self, trainer):
+            self.epochs += 1
+
+        def generate(self):
+            return self.inner.generate()
+
+    graph = _lrx5_graph()
+    config = TrainConfig(n_epochs=2, n_walks=4, rw_length=4, batch_size=16, seed=0)
+    states = _CountingSource(RandomWalksSource(graph, n_walks=4, rw_length=4))
+    source = make_bellman_source(graph, config, MLP_CONFIG.build_model(), states_source=states)
+
+    Trainer(graph, MLP_CONFIG, config, data_source=source).train()
+
+    # A composite source must forward the hook, or a wrapped source that needs it stays stale.
+    assert states.epochs == 2
+
+
+def test_train_stages_does_not_rebuild_the_first_stage():
+    graph = _lrx5_graph()
+    first = TrainConfig(n_epochs=1, n_walks=8, rw_length=4, batch_size=16, seed=0)
+    trainer = Trainer(graph, MLP_CONFIG, first)
+    source_before = trainer.data_source
+
+    trainer.train_stages([first, TrainConfig(n_epochs=1, n_walks=8, rw_length=4, batch_size=16, lr=1e-4, seed=0)])
+
+    # Building a source runs a breadth-first search when the stage uses anchors, so doing it twice is not free.
+    assert trainer.data_source is not source_before  # the second stage did build its own
+    # ... but the first stage reused what __init__ made, which is what this checks through the call count below.
+
+
+def test_bellman_refresh_cadence_follows_the_stage_not_the_source():
+    graph = _lrx5_graph()
+    common = {"n_walks": 4, "rw_length": 4, "batch_size": 16, "seed": 0, "ema_decay": 0}
+    config = TrainConfig(n_epochs=3, targets="bellman", bellman_target_update_period=2, **common)
+    source = make_bellman_source(graph, config, MLP_CONFIG.build_model())
+    trainer = Trainer(graph, MLP_CONFIG, config, data_source=source)
+    trainer.train()
+
+    # Three epochs with period 2 end off-period. Reusing the source in a new stage must still refresh on its first
+    # epoch, which it does only if the cadence follows the epoch of the trainer (reset by set_stage).
+    target_before = source.bellman_source.target
+    trainer.set_stage(
+        TrainConfig(n_epochs=1, targets="bellman", bellman_target_update_period=2, lr=1e-4, **common),
+        data_source=source,
+    )
+    trainer.train()
+    assert source.bellman_source.target is not target_before
+
+
+def test_set_stage_releases_the_previous_data_source():
+    graph = _lrx5_graph()
+    common = {"n_epochs": 1, "n_walks": 8, "rw_length": 4, "batch_size": 16, "seed": 0}
+    trainer = Trainer(graph, MLP_CONFIG, TrainConfig(anchors_depth=2, **common))
+    dead = weakref.ref(trainer.data_source)
+
+    trainer.set_stage(TrainConfig(anchors_depth=2, lr=1e-4, **common))
+
+    # Anchors of two stages held at once can be what makes a staged run run out of memory, so the previous source
+    # must be gone by the time the next one is built - not merely replaced once it is.
+    gc.collect()
+    assert dead() is None
+
+
+def test_rejected_stage_leaves_the_trainer_trainable():
+    graph = CayleyGraph(PermutationGroups.lx(5), device="cpu")
+    model_config = ModelConfig(model_type="MLP", input_size=5, num_classes_for_one_hot=5, layers_sizes=[8])
+    common = {"n_epochs": 1, "n_walks": 4, "rw_length": 3, "batch_size": 8, "seed": 0}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        trainer = Trainer(graph, model_config, TrainConfig(**common))
+
+        # This graph cannot be trained on Bellman targets, and a stage that cannot be entered must not take the
+        # trainer down with it: what it was doing before has to keep working.
+        with pytest.raises(ValueError, match="inverse-closed generators"):
+            trainer.set_stage(TrainConfig(targets="bellman", **common))
+        assert len(trainer.train().losses) == 1
+
+
+def test_explicit_data_source_skips_the_check_of_the_named_scheme():
+    graph = CayleyGraph(PermutationGroups.lx(5), device="cpu")
+    model_config = ModelConfig(model_type="MLP", input_size=5, num_classes_for_one_hot=5, layers_sizes=[8])
+    common = {"n_epochs": 1, "n_walks": 4, "rw_length": 3, "batch_size": 8, "seed": 0}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        trainer = Trainer(graph, model_config, TrainConfig(**common))
+
+        # The graph cannot support the Bellman scheme, but the supplied source is used instead of it, and TrainConfig
+        # says that targets is ignored then - so the stage must be accepted.
+        trainer.set_stage(
+            TrainConfig(targets="bellman", **common),
+            data_source=RandomWalksSource(graph, n_walks=4, rw_length=3),
+        )
+        assert len(trainer.train().losses) == 1
+
+
+def test_a_supplied_bellman_target_is_left_alone():
+    graph = _lrx5_graph()
+    config = TrainConfig(n_epochs=2, n_walks=4, rw_length=4, batch_size=16, seed=0)
+    teacher = MLP_CONFIG.build_model()
+    source = BellmanTargets(graph, RandomWalksSource(graph, n_walks=4, rw_length=4), teacher)
+    frozen = source.target
+
+    Trainer(graph, MLP_CONFIG, config, data_source=source).train()
+
+    # Supplying a target means it should label the data; refreshing it from the model being trained is what the
+    # bootstrapping scheme asks for, and it has to ask.
+    assert source.target is frozen

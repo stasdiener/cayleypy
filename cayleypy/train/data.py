@@ -33,6 +33,7 @@ from ..models.checkpoint import PathType
 
 if TYPE_CHECKING:
     from ..cayley_graph import CayleyGraph
+    from .trainer import Trainer
 
 # Mode of random walk generation used to produce targets for Q-models, see :class:`SparseQSampler`.
 _SPARSE_Q_RANDOM_WALK_MODE = "classic"
@@ -163,6 +164,9 @@ class DataSource(abc.ABC):
     A source is created once and generates a fresh piece of data every time :meth:`generate` is called - normally once
     per epoch, so that the model rarely sees the same state twice. How much data one call generates is configured when
     the source is created.
+
+    A source whose data depends on the model being trained refreshes that dependency in :meth:`on_epoch_start`, which
+    the trainer calls before every epoch.
     """
 
     @abc.abstractmethod
@@ -170,6 +174,16 @@ class DataSource(abc.ABC):
         """Generates one piece of training data.
 
         :return: States with target distances.
+        """
+
+    def on_epoch_start(self, trainer: "Trainer") -> None:
+        """Called by the trainer before the data of an epoch is generated. Does nothing by default.
+
+        This is where a source that reads the model being trained picks up its current weights - see
+        :class:`cayleypy.train.BellmanTargets`, whose targets come from a frozen copy of the model and would otherwise
+        never be refreshed. Sources that combine other sources must forward this call to them.
+
+        :param trainer: The trainer that is about to generate an epoch of data.
         """
 
 
@@ -674,6 +688,14 @@ class MixtureDataSource(DataSource):
             raise ValueError(f"Fractions must sum to 1, but they sum to {total}.")
         self.sources = list(sources)
         self.fractions = [float(fraction) for fraction in fractions]
+
+    def on_epoch_start(self, trainer: "Trainer") -> None:
+        """Forwards the call to every source of the mixture.
+
+        :param trainer: The trainer that is about to generate an epoch of data.
+        """
+        for source in self.sources:
+            source.on_epoch_start(trainer)
 
     def generate(self) -> TrainingData:
         """Generates data from all sources and mixes them in the configured proportions.

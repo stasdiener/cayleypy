@@ -4,8 +4,8 @@ import copy
 import math
 import typing
 import warnings
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Sequence
 
 import torch
 from torch import nn
@@ -27,10 +27,14 @@ class TrainResult:
     :param losses: Mean loss on every epoch. Because data is regenerated on every epoch, these are losses on states
         the model has not seen before, so they can be read as a validation curve.
     :param n_steps: Total number of optimizer steps made.
+    :param stage_losses: The same losses split by stage, for training run by :meth:`Trainer.train_stages`. A single
+        stage leaves this with one element; where the boundaries are matters, because the loss usually jumps at one
+        (the learning rate restarts, and with ``TrainConfig.targets="bellman"`` the targets change altogether).
     """
 
     losses: list[float]
     n_steps: int
+    stage_losses: list[list[float]] = field(default_factory=list)
 
 
 def _validate_model_config(model_config: ModelConfig, graph: "CayleyGraph") -> None:
@@ -139,17 +143,9 @@ class Trainer:
         self.model = (model_config.build_model() if model is None else model).to(graph.device)
         self.data_source = data_source if data_source is not None else self._make_data_source()
         self.loss = self.config.make_loss()
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay
-        )
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=self.config.n_epochs, eta_min=self.config.lr_min
-        )
+        self._reset_optimizer()
         self.ema_model: Optional[nn.Module] = None
-        if self.config.ema_decay > 0:
-            self.ema_model = copy.deepcopy(self.model).eval()
-            for parameter in self.ema_model.parameters():
-                parameter.requires_grad_(False)
+        self._reconcile_ema()
         self.epoch = 0
         self.n_steps = 0
 
@@ -165,8 +161,8 @@ class Trainer:
         Only weights are stored in checkpoints, so the optimizer, the learning rate schedule and the EMA copy start
         anew (the EMA copy starts from the weights that were loaded).
 
-        Subclasses of the trainer are created as well, so this is also the way to fine-tune a pretrained model with
-        another training scheme, e.g. :meth:`cayleypy.train.BellmanTrainer.from_checkpoint`.
+        To fine-tune a pretrained model with another training scheme, pass a config with the `targets` of that
+        scheme - or use :meth:`train_stages`, which keeps the model in memory instead of going through a file.
 
         :param path: Path to a checkpoint written by :func:`cayleypy.models.save_checkpoint` (e.g. by :meth:`save`).
         :param graph: Graph for which to continue training. If the checkpoint says which graph the model was trained
@@ -193,6 +189,12 @@ class Trainer:
         """Creates the data source described by the config."""
         config = self.config
         n_outputs = self.model_config.n_outputs
+        if config.targets == "bellman":
+            # Imported here and not at the top because bellman.py builds on this module's config: importing it
+            # there would be circular.
+            from .bellman import make_bellman_source  # pylint: disable=import-outside-toplevel
+
+            return make_bellman_source(self.graph, config, self.model, n_outputs=n_outputs)
         walks: DataSource
         if n_outputs == 1:
             walks = RandomWalksSource(
@@ -257,9 +259,13 @@ class Trainer:
     def train_epoch(self) -> float:
         """Generates data for one epoch and makes one pass over it.
 
+        The data source is told that an epoch is starting (:meth:`cayleypy.train.DataSource.on_epoch_start`) before
+        the data is generated, which is how a source that reads the model being trained picks up its current weights.
+
         :return: Mean loss on this epoch.
         """
         learning_rate = self.learning_rate
+        self.data_source.on_epoch_start(self)
         mean_loss = self.train_on_data(self.generate_data())
         self.scheduler.step()
         self.epoch += 1
@@ -278,7 +284,152 @@ class Trainer:
         losses = [self.train_epoch() for _ in range(self.config.n_epochs)]
         if self.config.verbose >= 1:
             print(f"Training finished in {self.n_steps} steps, loss on the last epoch: {losses[-1]:.5f}.")
-        return TrainResult(losses=losses, n_steps=self.n_steps)
+        return TrainResult(losses=losses, n_steps=self.n_steps, stage_losses=[losses])
+
+    def _validate_stage(self, config: TrainConfig) -> None:
+        """Checks that a stage described by this config can be entered, without changing anything.
+
+        :param config: Configuration of the stage.
+        :raises ValueError: If the stage cannot be trained for this graph.
+        """
+        if config.targets == "bellman":
+            # Imported here and not at the top because bellman.py builds on this module's config: importing it
+            # there would be circular.
+            from .bellman import check_bellman_graph  # pylint: disable=import-outside-toplevel
+
+            check_bellman_graph(self.graph)
+
+    def _reconcile_ema(self) -> None:
+        """Makes the EMA copy match `TrainConfig.ema_decay` of the current config.
+
+        A stage can turn averaging on or off, and the copy has to follow: switching it on starts a fresh copy from the
+        weights the previous stage left, and switching it off drops the copy instead of leaving a stale one that
+        :meth:`model_for_inference` would keep returning.
+        """
+        if self.config.ema_decay > 0:
+            if self.ema_model is None:
+                self.ema_model = copy.deepcopy(self.model).eval()
+                for parameter in self.ema_model.parameters():
+                    parameter.requires_grad_(False)
+        else:
+            self.ema_model = None
+
+    def _reset_optimizer(self) -> None:
+        """Creates the optimizer and the learning rate schedule described by the current config."""
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay
+        )
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=self.config.n_epochs, eta_min=self.config.lr_min
+        )
+
+    def set_stage(self, config: TrainConfig, data_source: Optional[DataSource] = None) -> None:
+        """Starts a new stage of training of the same model.
+
+        The model and its EMA copy carry over; the optimizer, the learning rate schedule and the epoch counter are
+        created anew, because a stage is a new training regime rather than a continuation of the previous one. This is
+        the difference from calling :meth:`train` twice, which reuses the optimizer of the first call.
+
+        The learning rate therefore jumps at a stage boundary - from `lr_min` of the previous config to `lr` of the
+        new one. That jump is a hyperparameter of staged training, not an accident, so a large one is reported when
+        `TrainConfig.verbose` is at least 1.
+
+        Entering a stage is not atomic: what the previous stage held is released before the next one is built, because
+        holding two sets of anchors or two optimizers at once is what makes a staged run run out of memory. Everything
+        that can be checked in advance is (see :meth:`_validate_stage`), but a failure during construction - a
+        breadth-first search that exceeds its limit, say - leaves the trainer unable to train, and it says so. The
+        weights survive, so a new trainer can continue from them.
+
+        :param config: Configuration of the new stage.
+        :param data_source: Where to get training data in this stage (optional). Defaults to the source described by
+            `config`, which is also how `TrainConfig.targets` takes effect. When one is given, `TrainConfig.targets` is
+            ignored, and so is the check of what its scheme would need of the graph.
+        :raises RuntimeError: If the stage could not be built after the previous one was released.
+        """
+        previous_lr = self.learning_rate
+        # Checked before anything is mutated: a stage that cannot be entered must leave the trainer in the stage it is
+        # in, rather than half-way into one with no data source to train on. A supplied source is used instead of the
+        # scheme named by the config, so what that scheme would need of the graph does not apply.
+        if data_source is None:
+            self._validate_stage(config)
+        self.config = config
+        if config.seed is not None:
+            torch.manual_seed(config.seed)
+        self.loss = config.make_loss()
+        # What the previous stage held is released before the next stage allocates. The optimizer keeps two moment
+        # tensors per parameter, and building a source runs a breadth-first search when the stage uses anchors - so
+        # holding both stages at once is what can make a staged run run out of memory, even though every stage fits.
+        del self.optimizer, self.scheduler
+        if config.ema_decay == 0:
+            self.ema_model = None
+        if data_source is None:
+            del self.data_source
+            try:
+                self.data_source = self._make_data_source()
+            except Exception as error:
+                raise RuntimeError(
+                    "Failed to enter the stage after the previous one was released, so this trainer cannot train any "
+                    "more. Its weights are intact: build a new trainer with model=trainer.model_for_inference() and a "
+                    "stage that fits. Releasing the previous stage first is deliberate - holding both at once is what "
+                    "makes a staged run run out of memory - so entering a stage is not an atomic operation."
+                ) from error
+        else:
+            self.data_source = data_source
+        self._reset_optimizer()
+        self._reconcile_ema()
+        self.epoch = 0
+        if config.verbose >= 1:
+            ratio = config.lr / previous_lr if previous_lr > 0 else float("inf")
+            note = "  <- large jump, check that this is intended" if ratio > 10 else ""
+            print(f"New stage: targets={config.targets}, lr {previous_lr:.3e} -> {config.lr:.3e} (x{ratio:.1f}){note}")
+
+    def train_stages(self, stages: Sequence[TrainConfig]) -> TrainResult:
+        """Trains the model through several stages, one after another.
+
+        Every stage is an ordinary training run described by its own config, applied to the model left by the previous
+        one - so a recipe like "pretrain on random walks, then fine-tune on Bellman targets with a lower learning
+        rate" is a list of two configs. The whole recipe is data, which makes runs reproducible and comparable.
+
+        Weights and their EMA copy carry over between stages; see :meth:`set_stage` for what does not, and for the
+        jump of the learning rate that a boundary implies.
+
+        Example:
+
+        >>> from cayleypy import CayleyGraph, PermutationGroups
+        >>> from cayleypy.models import ModelConfig
+        >>> from cayleypy.train import TrainConfig, Trainer
+        >>> graph = CayleyGraph(PermutationGroups.lrx(4), device="cpu")
+        >>> model_config = ModelConfig(model_type="MLP", input_size=4, num_classes_for_one_hot=4, layers_sizes=[16])
+        >>> common = dict(n_walks=8, rw_length=4, batch_size=16, seed=0)
+        >>> stages = [
+        ...     TrainConfig(n_epochs=2, **common),
+        ...     TrainConfig(n_epochs=1, targets="bellman", lr=1e-4, **common),
+        ... ]
+        >>> result = Trainer(graph, model_config, stages[0]).train_stages(stages)
+        >>> [len(stage) for stage in result.stage_losses]
+        [2, 1]
+
+        :param stages: Configuration of every stage, in order. Must be non-empty. Passing the config the trainer was
+            created with as the first stage is not double work - that stage is entered already, and it is not set up
+            again.
+        :return: Result of training, with the loss curve of the whole run and its split by stage.
+        """
+        if len(stages) == 0:
+            raise ValueError("At least one stage is needed.")
+        stage_losses = []
+        for index, config in enumerate(stages):
+            # The documented flow passes the config the trainer was created with as the first stage. Entering it again
+            # would rebuild the data source that __init__ has just built, and building one runs a breadth-first search
+            # when the stage uses anchors - so a large anchor table would be computed twice and held twice at once.
+            already_entered = index == 0 and config is self.config and self.epoch == 0
+            if not already_entered:
+                self.set_stage(config)
+            stage_losses.append(self.train().losses)
+        return TrainResult(
+            losses=[loss for stage in stage_losses for loss in stage],
+            n_steps=self.n_steps,
+            stage_losses=stage_losses,
+        )
 
     def predictor(self, use_ema: bool = True) -> Predictor:
         """Creates predictor using the trained model, e.g. to pass it to beam search.

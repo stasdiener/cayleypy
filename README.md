@@ -226,7 +226,7 @@ import torch
 
 from cayleypy import CayleyGraph, EnsemblePredictor, PermutationGroups, Predictor
 from cayleypy.models import ModelConfig, load_checkpoint
-from cayleypy.train import BellmanTrainer, TrainConfig, Trainer
+from cayleypy.train import TrainConfig, Trainer
 
 graph = CayleyGraph(PermutationGroups.lrx(14), device="cpu", random_seed=42)
 
@@ -268,12 +268,13 @@ finetune_config = TrainConfig(
     lr=1e-4,
     lr_min=1e-6,
     ema_decay=0.999,
+    targets="bellman",  # Bootstrapped targets instead of walk lengths.
     bellman_anchors_depth=6,  # Bellman targets need anchors: they are what keeps the scale from drifting.
     anchors_fraction=0.02,
     seed=42,
     verbose=1,
 )
-finetuner = BellmanTrainer.from_checkpoint("lrx_14_q_resmlp.pt", graph, finetune_config)
+finetuner = Trainer.from_checkpoint("lrx_14_q_resmlp.pt", graph, finetune_config)
 finetuner.train()
 finetuner.save("lrx_14_q_resmlp_bellman.pt")
 

@@ -11,11 +11,11 @@ where ``V_target`` is a frozen copy of the model being trained (the `target`). E
 the central state, whose distance is known exactly - this is what the DAVI ("deep approximate value iteration")
 algorithm does, and it is why anchors (states whose exact distance is known) must be mixed into the data: bootstrapped
 targets say how far states are from each other, and something has to say where the goal is, otherwise the whole scale
-drifts. :class:`BellmanTrainer` mixes anchors in and refreshes the target for you.
+drifts. :func:`make_bellman_source` mixes anchors in, and :class:`BellmanTargets` refreshes the target for you.
 
 The recursion above looks at where the moves from a state lead, so it bootstraps the distance to the central state,
 while the anchors it is mixed with come from a search starting at the central state and measure the distance from it.
-These are the same distance only for inverse-closed generators, which is why :class:`BellmanTrainer` requires them - for
+These are the same distance only for inverse-closed generators, which is why the Bellman scheme requires them - for
 a graph whose generators are not inverse closed, train on the graph returned by
 ``CayleyGraph.with_inverted_generators``.
 
@@ -40,11 +40,11 @@ from torch import nn
 
 from .config import TrainConfig
 from .data import BfsAnchors, DataSource, RandomWalksSource, TrainingData
-from .trainer import Trainer
 from ..predictor import Predictor
 
 if typing.TYPE_CHECKING:
     from ..cayley_graph import CayleyGraph
+    from .trainer import Trainer
     from ..models.models import ModelConfig
 
 # Anything that can estimate distances of states: a model, a Predictor, or any callable mapping states to scores.
@@ -157,7 +157,7 @@ class BellmanTargets(DataSource):
 
     The target model is a frozen copy, so training the model does not change targets until :meth:`update_target` is
     called with the new weights - which is what keeps value iteration from chasing its own tail.
-    :class:`BellmanTrainer` does that once every `TrainConfig.bellman_target_update_period` epochs.
+    :meth:`on_epoch_start` does that once every `target_update_period` epochs.
 
     Example:
 
@@ -178,6 +178,7 @@ class BellmanTargets(DataSource):
         states_source: DataSource,
         target_model: TargetModel,
         n_outputs: int = 1,
+        target_update_period: Optional[int] = None,
     ):
         """Initializes BellmanTargets.
 
@@ -188,12 +189,36 @@ class BellmanTargets(DataSource):
             not change targets until :meth:`update_target` is called.
         :param n_outputs: Number of outputs of the model to train - 1 for a model estimating the distance of a state, or
             the number of generators for a Q-model.
+        :param target_update_period: How many epochs to keep the target before refreshing it from the model being
+            trained, see :meth:`on_epoch_start`. None (the default) never refreshes it on its own, which is what a
+            caller who supplied a target of their own means by supplying it - the DAVI scheme built by
+            :func:`make_bellman_source` opts in instead.
         """
         _check_n_outputs(graph, n_outputs)
+        if target_update_period is not None and target_update_period < 1:
+            raise ValueError(f"target_update_period must be at least 1, got {target_update_period}.")
         self.graph = graph
         self.states_source = states_source
         self.n_outputs = int(n_outputs)
         self.target = self._frozen_copy(target_model)
+        self.target_update_period = None if target_update_period is None else int(target_update_period)
+
+    def on_epoch_start(self, trainer: "Trainer") -> None:
+        """Refreshes the target from the model being trained, every `target_update_period` epochs.
+
+        This is what makes the targets follow the model: without it the frozen copy made at construction would label
+        every epoch, and training would fit a fixed function instead of bootstrapping. It only happens when
+        `target_update_period` was set - a target supplied by the caller is left alone, because replacing it is not
+        what supplying it means. The call is forwarded to the source of states regardless.
+
+        :param trainer: The trainer that is about to generate an epoch of data.
+        """
+        self.states_source.on_epoch_start(trainer)
+        # The cadence follows the epoch of the trainer rather than a counter of this source, because a stage boundary
+        # resets that epoch: a source reused across stages would otherwise carry the count of the previous stage into
+        # the new one and could skip the refresh of its first epoch.
+        if self.target_update_period is not None and trainer.epoch % self.target_update_period == 0:
+            self.update_target(trainer.model_for_inference())
 
     def update_target(self, model: TargetModel) -> None:
         """Replaces the target with a frozen copy of the given model, so that later targets use its weights.
@@ -228,7 +253,8 @@ class _BellmanWithAnchors(DataSource):
     """Bellman targets with a share of anchors sized from the states that were actually generated.
 
     The size of an epoch is not known before it is generated, because the source of states is arbitrary - it can be a
-    source the caller passed to :class:`BellmanTrainer`. Sizing the anchors in advance from `n_walks` and `rw_length`
+    source the caller passed to :func:`make_bellman_source`. Sizing the anchors in advance from `n_walks` and
+    `rw_length`
     and mixing with :class:`cayleypy.train.MixtureDataSource` would cut a source that generates more states than that
     down to what the anchors can support, so most of what it generated would never be trained on. Here the anchors are
     sized from the data instead, and nothing is thrown away - they are sampled with repetitions, so any number of them
@@ -246,6 +272,13 @@ class _BellmanWithAnchors(DataSource):
         self.anchors = anchors
         self.anchors_fraction = anchors_fraction
 
+    def on_epoch_start(self, trainer: "Trainer") -> None:
+        """Forwards the call to the source of Bellman targets.
+
+        :param trainer: The trainer that is about to generate an epoch of data.
+        """
+        self.bellman_source.on_epoch_start(trainer)
+
     def generate(self) -> TrainingData:
         """Generates Bellman targets and adds the anchors' share of them.
 
@@ -257,101 +290,64 @@ class _BellmanWithAnchors(DataSource):
         return TrainingData.concat([data, self.anchors.generate()])
 
 
-class BellmanTrainer(Trainer):
-    """Trains a model on Bellman targets, refreshing the target as training goes (the DAVI algorithm).
+def check_bellman_graph(graph: "CayleyGraph") -> None:
+    """Checks that the Bellman scheme can be used for this graph.
 
-    This is the same training loop as :class:`cayleypy.train.Trainer`, with the data of every epoch built as:
+    This is separate from :func:`make_bellman_source` so that a trainer can reject a stage before it starts entering
+    it, instead of failing halfway through and leaving itself without a data source.
 
-    - states from random walks (or from `states_source`), with targets computed by :func:`bellman_targets` from a frozen
-      copy of the model - see :class:`BellmanTargets`;
-    - anchors - states around the central state with exact distances from a breadth-first search of depth
-      `TrainConfig.bellman_anchors_depth` (1 by default, i.e. the central state and its neighbors), taking
-      `TrainConfig.anchors_fraction` of the data. Unlike in :class:`cayleypy.train.Trainer`, anchors are not optional:
-      bootstrapped targets only say how far states are from each other, and without exactly known distances the scale of
-      the predictions drifts.
-
-    Every `TrainConfig.bellman_target_update_period` epochs the target is refreshed from the model being trained (from
-    its EMA copy, if one is maintained). Refreshing every epoch (the default) means the target is the EMA copy, i.e. it
-    lags behind by design; a larger period gives a target that is held fixed for several epochs instead.
-
-    This is normally used to fine-tune a model pretrained on random walks, whose targets are upper estimates of the
-    distance - and the reason to do it is that the estimates are loose exactly where beam search spends its time.
-    Fine-tuning starts from a checkpoint (:meth:`from_checkpoint`) with a learning rate lower than the one used for
-    pretraining: targets move as the model moves, and a large step in that feedback loop makes training oscillate.
-
-    Generators must be inverse closed (see the module docstring).
-
-    Q-models (one output per generator) are trained here as well, and get more out of it than models with one output: a
-    random walk labels two outputs of a state (see :class:`cayleypy.train.SparseQSampler`), while Bellman targets label
-    all of them, and they do not need walks to be paths, so `TrainConfig.rw_mode` is honored for Q-models too.
-
-    Example:
-
-    >>> from cayleypy import CayleyGraph, PermutationGroups
-    >>> from cayleypy.models import ModelConfig
-    >>> from cayleypy.train import BellmanTrainer, TrainConfig
-    >>> graph = CayleyGraph(PermutationGroups.lrx(4), device="cpu")
-    >>> model_config = ModelConfig(model_type="MLP", input_size=4, num_classes_for_one_hot=4, layers_sizes=[16])
-    >>> train_config = TrainConfig(n_epochs=2, n_walks=8, rw_length=4, batch_size=16, lr=1e-4, seed=0)
-    >>> result = BellmanTrainer(graph, model_config, train_config).train()
-    >>> len(result.losses)
-    2
+    :param graph: Graph to check.
+    :raises ValueError: If the generators of the graph are not inverse closed.
     """
+    if not graph.definition.generators_inverse_closed:
+        raise ValueError(
+            'Bellman targets (TrainConfig.targets="bellman") require inverse-closed generators (for every generator, '
+            "its inverse must also be a generator), because they measure the distance to the central state while the "
+            "anchors they are mixed with measure the distance from it. Train on CayleyGraph.with_inverted_generators "
+            "instead."
+        )
 
-    def __init__(
-        self,
-        graph: "CayleyGraph",
-        model_config: "ModelConfig",
-        config: Optional[TrainConfig] = None,
-        model: Optional[nn.Module] = None,
-        states_source: Optional[DataSource] = None,
-    ):
-        """Initializes BellmanTrainer.
 
-        :param graph: Graph for which to train the model.
-        :param model_config: Config describing the model to train, see :class:`cayleypy.train.Trainer`.
-        :param config: Configuration of the training process. Defaults to `TrainConfig()`.
-        :param model: Model to train (optional). Defaults to a model built from `model_config`. Pass a model, or use
-            :meth:`from_checkpoint`, to fine-tune an existing one.
-        :param states_source: Where to take states to compute targets for (optional). Defaults to random walks
-            described by `config`. Its targets are ignored - only states are used.
-        """
-        if not graph.definition.generators_inverse_closed:
-            # Bellman targets are the distance to the central state, the mandatory anchors are the distance from it.
-            raise ValueError(
-                "BellmanTrainer requires inverse-closed generators (for every generator, its inverse must also be a "
-                "generator), because its targets measure the distance to the central state while the anchors it mixes "
-                "them with measure the distance from it. Train on CayleyGraph.with_inverted_generators instead."
-            )
-        self._states_source = states_source
-        super().__init__(graph, model_config, config=config, model=model)
+def make_bellman_source(
+    graph: "CayleyGraph",
+    config: TrainConfig,
+    model: TargetModel,
+    n_outputs: int = 1,
+    states_source: Optional[DataSource] = None,
+) -> DataSource:
+    """Builds the data source of the Bellman training scheme described by a config.
 
-    def _make_data_source(self) -> DataSource:
-        """Creates the mixture of Bellman targets and anchors described by the config."""
-        config = self.config
-        n_outputs = self.model_config.n_outputs
-        states_source = self._states_source
-        if states_source is None:
-            states_source = RandomWalksSource(
-                self.graph,
-                n_walks=config.n_walks,
-                rw_length=config.rw_length,
-                mode=config.rw_mode,
-                nbt_history_depth=config.nbt_history_depth,
-            )
-        # The model itself is the first target: the EMA copy does not exist yet (it is created after the data source)
-        # and it starts as a copy of the model anyway.
-        self.bellman_source = BellmanTargets(self.graph, states_source, self.model, n_outputs=n_outputs)
-        # The anchors are sized when data is generated, from the number of states the source actually produced - see
-        # _BellmanWithAnchors for why that cannot be decided here.
-        anchors = BfsAnchors(self.graph, depth=config.bellman_anchors_depth, n_outputs=n_outputs)
-        return _BellmanWithAnchors(self.bellman_source, anchors, config.anchors_fraction)
+    This is what :class:`cayleypy.train.Trainer` uses for ``TrainConfig.targets="bellman"``: states from random walks
+    labeled by :class:`BellmanTargets`, with a mandatory share of anchors (see :class:`BellmanTargets` for why they
+    cannot be left out).
 
-    def train_epoch(self) -> float:
-        """Refreshes the target if it is due, then generates data for one epoch and makes one pass over it.
-
-        :return: Mean loss on this epoch.
-        """
-        if self.epoch % self.config.bellman_target_update_period == 0:
-            self.bellman_source.update_target(self.model_for_inference())
-        return super().train_epoch()
+    :param graph: Graph to compute targets in. Its generators must be inverse closed, because the targets measure the
+        distance to the central state while the anchors measure the distance from it.
+    :param config: Configuration of the training process.
+    :param model: Model whose frozen copy computes the first targets. Later targets come from the model being trained,
+        see :meth:`BellmanTargets.on_epoch_start`.
+    :param n_outputs: Number of outputs of the model - 1, or the number of generators for a Q-model.
+    :param states_source: Where to take states to label (optional). Defaults to random walks described by `config`;
+        its targets are ignored, only states are used.
+    :return: The data source.
+    """
+    check_bellman_graph(graph)
+    if states_source is None:
+        states_source = RandomWalksSource(
+            graph,
+            n_walks=config.n_walks,
+            rw_length=config.rw_length,
+            mode=config.rw_mode,
+            nbt_history_depth=config.nbt_history_depth,
+        )
+    bellman = BellmanTargets(
+        graph,
+        states_source,
+        model,
+        n_outputs=n_outputs,
+        target_update_period=config.bellman_target_update_period,
+    )
+    # The anchors are sized when data is generated, from the number of states the source actually produced - see
+    # _BellmanWithAnchors for why that cannot be decided here.
+    anchors = BfsAnchors(graph, depth=config.bellman_anchors_depth, n_outputs=n_outputs)
+    return _BellmanWithAnchors(bellman, anchors, config.anchors_fraction)

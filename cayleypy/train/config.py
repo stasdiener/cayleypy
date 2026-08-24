@@ -8,6 +8,7 @@ from .losses import Loss, make_loss
 # Modes of random walk generation that can be used to produce training data, see
 # :class:`cayleypy.algo.RandomWalksGenerator`.
 RANDOM_WALK_MODES = ("classic", "bfs", "nbt")
+TARGET_SOURCES = ("walks", "bellman")
 
 
 def _check_positive(name: str, value: float) -> None:
@@ -34,7 +35,7 @@ class TrainConfig:
         fastest, meaning the number of steps is the closest estimate of the true distance. Ignored by
         :class:`cayleypy.train.Trainer` when training a Q-model: its data comes from
         :class:`cayleypy.train.SparseQSampler`, which needs walks to be paths and therefore always uses "classic" walks.
-        :class:`cayleypy.train.BellmanTrainer` honors it for Q-models too, because Bellman targets label every output of
+        the "bellman" scheme honors it for Q-models too, because Bellman targets label every output of
         a state and so do not need walks to be paths.
     :param nbt_history_depth: For "nbt" mode, how many previous levels to remember and ban from revisiting. Must be at
         least 1 in that mode, because a walk that bans nothing never counts a step.
@@ -43,15 +44,15 @@ class TrainConfig:
         needed for the search grows quickly with this depth.
     :param anchors_fraction: Share of anchors in the data of one epoch (ignored if `anchors_depth` is 0, but still
         required to be strictly between 0 and 1 - to train without anchors, leave `anchors_depth` at 0 and this field
-        at its default; :class:`cayleypy.train.BellmanTrainer` always uses it, because anchors are mandatory there). A
+        at its default; the "bellman" scheme always uses it, because anchors are mandatory there). A
         few per cent is what helps; a large share (10% and more, empirically) makes the model good near the central
         state and worse where beam search actually spends its time.
-    :param bellman_anchors_depth: Depth of the breadth-first search producing anchors for
-        :class:`cayleypy.train.BellmanTrainer`, which needs them (unlike the walk-based trainer, where `anchors_depth`
+    :param bellman_anchors_depth: Depth of the breadth-first search producing anchors for the "bellman" scheme,
+        which needs them (unlike the walk-based trainer, where `anchors_depth`
         is 0 by default): bootstrapped targets only say how far states are from each other, so without exactly known
         distances the scale of the predictions drifts. Must be at least 1, which means the central state and its
         neighbors. Ignored when training on walk targets.
-    :param bellman_target_update_period: How many epochs :class:`cayleypy.train.BellmanTrainer` keeps the target (the
+    :param bellman_target_update_period: How many epochs the "bellman" scheme keeps the target (the
         frozen copy of the model that computes targets) before refreshing it from the model being trained. 1 (the
         default) means the target is the EMA copy of the weights, which lags behind by design; a larger value holds it
         fixed for several epochs instead. Ignored when training on walk targets.
@@ -66,6 +67,15 @@ class TrainConfig:
     :param tau: Quantile for the pinball loss (ignored by other losses).
     :param seed: Random seed. If set, training is deterministic on a given device.
     :param verbose: Level of logging. 0 means no logging, 1 means one line per epoch.
+    :param targets: Where target distances come from - one of:
+
+        - "walks" (the default) - the number of steps at which a random walk visited a state, which is an upper
+          estimate of its distance;
+        - "bellman" - bootstrapped targets computed from a frozen copy of the model being trained, mixed with anchors
+          (see :class:`cayleypy.train.BellmanTargets`). This is normally a later stage of training, starting from a
+          model pretrained on walks, and it needs inverse-closed generators.
+
+        Ignored when a `data_source` is passed to the trainer.
     """
 
     n_epochs: int = 100
@@ -86,6 +96,8 @@ class TrainConfig:
     tau: float = 0.5
     seed: Optional[int] = None
     verbose: int = 0
+    # Declared last so that adding it does not shift the positional arguments of this dataclass.
+    targets: str = "walks"
 
     def __post_init__(self):
         _check_positive("n_epochs", self.n_epochs)
@@ -94,6 +106,8 @@ class TrainConfig:
         _check_positive("lr", self.lr)
         if self.rw_length < 2:
             raise ValueError(f"rw_length must be at least 2, got {self.rw_length}.")
+        if self.targets not in TARGET_SOURCES:
+            raise ValueError(f'Unknown targets: "{self.targets}". Supported values are: {TARGET_SOURCES}.')
         if self.rw_mode not in RANDOM_WALK_MODES:
             raise ValueError(f'Unknown rw_mode: "{self.rw_mode}". Supported modes are: {RANDOM_WALK_MODES}.')
         if self.nbt_history_depth < 0:

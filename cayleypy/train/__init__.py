@@ -1,4 +1,4 @@
-from .bellman import BellmanTargets, BellmanTrainer, bellman_targets
+from .bellman import BellmanTargets, bellman_targets, make_bellman_source
 from .config import TrainConfig
 from .data import (
     BfsAnchors,

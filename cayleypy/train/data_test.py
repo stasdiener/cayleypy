@@ -253,7 +253,7 @@ def test_bfs_anchors_for_q_model_skips_states_with_unknown_children():
 
 
 def test_bfs_anchors_for_q_model_cover_the_same_states_as_for_one_output():
-    """Test that a Q-model gets anchors for every state within `depth`, depth 1 (a BellmanTrainer default) included."""
+    """Test that a Q-model gets anchors for every state within `depth`, depth 1 (the Bellman default) included."""
     graph = _lrx5()
 
     for depth in (1, 2, 3):
